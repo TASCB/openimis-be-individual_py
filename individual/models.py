@@ -1,14 +1,12 @@
+import core
 from django.conf import settings
 from django.db import models, transaction
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils.translation import gettext_lazy as _
-
-import core
 from core.models import HistoryModel
 from graphql import ResolveInfo
 from location.models import Location, LocationManager
-
 
 
 class Individual(HistoryModel):
@@ -86,6 +84,7 @@ class IndividualDataSource(HistoryModel):
     individual = models.ForeignKey(Individual, models.DO_NOTHING, blank=True, null=True)
     upload = models.ForeignKey(IndividualDataSourceUpload, models.DO_NOTHING, blank=True, null=True)
     validations = models.JSONField(blank=True, default=dict)
+    # pmt_score = models.FloatField(editable=False, null=True)
 
 
 class IndividualDataUploadRecords(HistoryModel):

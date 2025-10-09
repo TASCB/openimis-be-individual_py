@@ -1,8 +1,10 @@
 import graphene
+import graphene_django_optimizer as gql_optimizer
+from django.forms import FloatField
+from sqlalchemy import Cast
 from django.contrib.auth.models import AnonymousUser
 from graphene_django import DjangoObjectType
-import graphene_django_optimizer as gql_optimizer
-
+from django.db.models.fields.json import KeyTextTransform
 from core import prefix_filterset, ExtendedConnection
 from core.gql_queries import UserGQLType
 from individual.apps import IndividualConfig

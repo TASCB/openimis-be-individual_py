@@ -2,7 +2,6 @@ import logging
 import json
 import mimetypes
 import os
-
 import numpy as np
 import pandas as pd
 from django.db.models import Q
@@ -11,20 +10,25 @@ from django.utils.translation import gettext as _
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
-
 from core.utils import DefaultStorageFileHandler
 from core.views import check_user_rights
 from individual.apps import IndividualConfig
-from individual.models import IndividualDataSource
+from individual.models import Individual, IndividualDataSource
 from individual.services import IndividualImportService
-
 from django.core.files.uploadedfile import InMemoryUploadedFile
-
 from workflow.services import WorkflowService
+from faker import Faker
+from django.conf import settings
+try:
+    if 'report' in settings.INSTALLED_APPS:
+        from report.services import ReportService  # real service
+    else:
+        ReportService = None
+except Exception:
+    ReportService = None
 
 # Set up logging for the module
 logger = logging.getLogger(__name__)
-
 
 ALLOWED_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 ALLOWED_MIME_TYPES = {
@@ -35,6 +39,57 @@ ALLOWED_MIME_TYPES = {
 
 mimetypes.add_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx")
 mimetypes.add_type("application/vnd.ms-excel", ".xls")
+
+template = """{
+    "docElements": [
+        {
+            "type": "text",
+            "id": 1,
+            "content": "Individual Report",
+            "fontSize": 18,
+            "bold": true,
+            "alignment": "center",
+            "margin": [0, 0, 0, 20]
+        }
+    ],
+    
+}"""
+
+def eligible_households_report(request):
+    if ReportService is None:
+        # clean response when reporting is disabled
+        return JsonResponse(
+            {"detail": "Reporting is disabled (report module not installed)."},
+            status=501,
+        )
+
+    report_service = ReportService(request.user)
+    data = {
+        "users": [
+            {
+                "id": fake.uuid4(),
+                "email": fake.email(),
+                "first_name": fake.first_name(),
+                "last_name": fake.last_name(),
+            }
+            for _ in range(100)
+        ]
+    }
+    return report_service.process("eligible_households_report", data, template)
+
+
+def individual_report(request):
+    if ReportService is None:
+        return JsonResponse(
+            {"detail": "Reporting is disabled (report module not installed)."},
+            status=501,
+        )
+
+    # If/when you enable it:
+    # report_service = ReportService(request.user)
+    # data = {"individuals": [v for v in Individual.get_queryset(None, request.user)]}
+    # return report_service.process('individual_report', data, template)
+    return JsonResponse({"detail": "Not implemented"}, status=501)
 
 
 def is_valid_file(import_file):

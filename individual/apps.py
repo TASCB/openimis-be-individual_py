@@ -42,7 +42,7 @@ DEFAULT_CONFIG = {
         'json_ext.educated_level'
     ],
     "individual_base_fields": [
-        'first_name', 'last_name', 'dob', 'location_name', 'location_code', 'id'
+        'first_name', 'last_name', 'dob', 'location_name', 'location_code', 'id','group_code'
     ]
 }
 
@@ -80,10 +80,10 @@ class IndividualConfig(AppConfig):
     validation_upload_valid_items_workflow = None
     validation_upload_valid_items = None
 
-    enable_maker_checker_for_individual_upload = None
-    enable_maker_checker_for_group_upload = None
-    enable_maker_checker_for_individual_update = None
-    enable_maker_checker_for_group_update = None
+    enable_maker_checker_for_individual_upload = True
+    enable_maker_checker_for_group_upload = True
+    enable_maker_checker_for_individual_update = True
+    enable_maker_checker_for_group_update = True
     individual_mask_fields = None
     individual_masking_enabled = None
     individual_base_fields = None

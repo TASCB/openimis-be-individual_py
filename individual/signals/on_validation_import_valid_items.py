@@ -2,10 +2,8 @@ import logging
 import random
 import string
 from typing import List
-
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.db.models import F, Q
-
 from core.models import User
 from individual.apps import IndividualConfig
 from individual.models import (

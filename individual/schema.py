@@ -2,10 +2,8 @@ import json
 import graphene
 import graphene_django_optimizer as gql_optimizer
 import pandas as pd
-
 from django.contrib.auth.models import AnonymousUser
 from django.db.models import Q, OuterRef, Subquery
-
 from core.custom_filters import CustomFilterWizardStorage
 from core.gql.export_mixin import ExportableQueryMixin
 from core.schema import OrderedDjangoFilterConnectionField

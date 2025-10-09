@@ -38,9 +38,7 @@ if 'opensearch_reports' in apps.app_configs:
 
         class Django:
             model = Individual
-            fields = [
-                'id'
-            ]
+            fields = ['id']
             queryset_pagination = 5000
 
         def prepare_json_ext(self, instance):
