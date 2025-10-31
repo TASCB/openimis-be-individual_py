@@ -1,7 +1,6 @@
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from django.forms import FloatField
-from sqlalchemy import Cast
 from django.contrib.auth.models import AnonymousUser
 from graphene_django import DjangoObjectType
 from django.db.models.fields.json import KeyTextTransform
