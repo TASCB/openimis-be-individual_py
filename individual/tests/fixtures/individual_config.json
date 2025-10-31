@@ -1,0 +1,3 @@
+{
+  "individual_schema": "{\"$id\": \"https://example.com/beneficiares.schema.json\", \"type\": \"object\", \"title\": \"Record of beneficiares\", \"$schema\": \"http://json-schema.org/draft-04/schema#\", \"properties\": {\"poor\": {\"type\": \"boolean\", \"description\": \"Flag determining whether someone is poor\"}, \"educated_level\": {\"type\": \"string\", \"description\": \"The level of person when it comes to the school/education/studies\"}, \"number_of_children\": {\"type\": \"integer\", \"description\": \"Number of children\"}}, \"description\": \"This document records the details beneficiares\"}"
+}

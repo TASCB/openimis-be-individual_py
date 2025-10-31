@@ -1,6 +1,8 @@
 import logging
+import json
 
 from django.apps import AppConfig
+from django.db.models.signals import post_save
 
 from core.custom_filters import CustomFilterRegistryPoint
 from core.data_masking import MaskingClassRegistryPoint
@@ -97,6 +99,31 @@ class IndividualConfig(AppConfig):
         self.__initialize_custom_filters()
         self._set_up_workflows()
         self.__register_masking_class()
+        self.__connect_signals()
+
+    def __connect_signals(self):
+        from core.models import ModuleConfiguration
+        post_save.connect(
+            self._reload_module_config,
+            sender=ModuleConfiguration,
+            weak=False
+        )
+
+    def _reload_module_config(self, sender, instance, **kwargs):
+        if instance.module == self.name and instance.layer == 'be':
+            db_config = json.loads(instance.config)
+            config = {**DEFAULT_CONFIG, **db_config}
+            self.__load_config(config)
+            self.__validate_individual_schema(config)
+
+            # Reinitialize custom filters to apply the new schema
+            self.__initialize_custom_filters()
+
+            # Workflow needs to be re-registered, otherwise default/invalid ones would apply
+            self._set_up_workflows()
+
+            # TODO: handle reloading of masking configs
+            logger.info(f"Reloaded app configs (except masking configs) for {self.name} module")
 
     @classmethod
     def __load_config(cls, cfg):

@@ -4,6 +4,7 @@ from rest_framework.test import APITestCase
 from rest_framework import status
 from django.urls import reverse
 from core.test_helpers import create_test_interactive_user
+from core.models import ModuleConfiguration
 
 
 class TestView(APITestCase):
@@ -12,6 +13,9 @@ class TestView(APITestCase):
         super().setUpClass()
         cls.test_file_path = os.path.join(
             os.path.dirname(__file__), 'fixtures', 'individual_upload.csv'
+        )
+        cls.test_config_path = os.path.join(
+            os.path.dirname(__file__), 'fixtures', 'individual_config.json'
         )
 
     def setUp(self):
@@ -35,6 +39,33 @@ class TestView(APITestCase):
             expected_base_csv_header in content,
             f'Expect csv template header to contain {expected_base_csv_header}, but got {content}'
         )
+
+    def test_download_template_file_on_individual_schema_update(self):
+        # First set the individual config to be empty
+        config = ModuleConfiguration.objects.filter(module='individual', layer='be')
+        if not config:
+            config = ModuleConfiguration(module='individual', layer='be', config='{}')
+        else:
+            config.config = '{}'
+        config.save()
+
+        # Then update individual config to with the fixture config
+        with open(self.test_config_path, 'rb') as test_file:
+            config.config = test_file.read()
+        config.save()
+
+        self.client.force_authenticate(user=self.admin_user)
+        url = reverse('download_template_file')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Check the template file contains individual schema fields from fixture config
+        content = b"".join(response.streaming_content).decode('utf-8')
+        for expected_column in ('poor', 'educated_level', 'number_of_children'):
+            self.assertTrue(
+                expected_column in content,
+                f'Expect csv template header to contain {expected_column}, but got {content}'
+            )
 
     @patch('individual.views.WorkflowService')
     @patch('individual.views.IndividualImportService')
