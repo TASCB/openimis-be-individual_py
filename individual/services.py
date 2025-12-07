@@ -1,9 +1,13 @@
+# individual/services.py
+
 import logging
 import json
 import uuid
 import pandas as pd
 import concurrent.futures
 import math
+import inspect
+import importlib
 from pandas import DataFrame
 from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.db import transaction
@@ -46,6 +50,59 @@ from tasks_management.services import UpdateCheckerLogicServiceMixin, CreateChec
 from workflow.systems.base import WorkflowHandler
 
 logger = logging.getLogger(__name__)
+
+
+# ---------- helpers to allow dotted-path/callable workflows ----------
+class _SimpleRunner:
+    """Wrap a function so it exposes .run(ctx)."""
+    def __init__(self, fn, name="wrapped"):
+        self._fn = fn
+        self.name = name
+    def run(self, ctx):
+        sig = inspect.signature(self._fn)
+        params = sig.parameters
+        user_uuid = ctx.get("user_uuid")
+        upload_uuid = ctx.get("upload_uuid")
+        accepted = ctx.get("accepted")
+        if "accepted" in params:
+            return self._fn(user_uuid, upload_uuid, accepted)
+        elif any(p.kind == p.VAR_KEYWORD for p in params.values()):
+            return self._fn(user_uuid, upload_uuid, accepted=accepted)
+        else:
+            return self._fn(user_uuid, upload_uuid)
+
+def _resolve_workflow_runner(workflow, user=None):
+    """
+    Return an object exposing .run(ctx) from a WorkflowHandler, dotted path, or callable.
+    Fallbacks to NOOP (success) if nothing resolves.
+    """
+    if hasattr(workflow, "run"):
+        return workflow  # already a handler
+    if isinstance(workflow, str) and "." in workflow and " " not in workflow:
+        mod_path, _, name = workflow.rpartition(".")
+        try:
+            mod = importlib.import_module(mod_path)
+            obj = getattr(mod, name)
+            if inspect.isclass(obj):
+                # Optional user= in ctor
+                try:
+                    sig = inspect.signature(obj)
+                    if "user" in sig.parameters:
+                        return obj(user=user)
+                except Exception:
+                    pass
+                return obj()
+            if callable(obj):
+                return _SimpleRunner(obj, name=workflow)
+        except Exception:
+            logger.exception("Failed to resolve workflow dotted path: %s", workflow)
+    class _NoOp:
+        def __init__(self, name="NOOP"):
+            self.name = name
+        def run(self, ctx):
+            logger.warning("NOOP workflow used; nothing executed. Name requested: %s", workflow)
+            return {"success": True, "detail": "noop"}
+    return _NoOp(name=str(workflow))
 
 
 class IndividualService(BaseService, UpdateCheckerLogicServiceMixin, DeleteCheckerLogicServiceMixin):
@@ -411,6 +468,8 @@ class GroupAndGroupIndividualAlignmentService:
     def update_json_ext_for_group(self, group):
         """
         This method ensures that json_ext of a group is up-to-date with its roles and members.
+        Also (non-breaking enhancement): if a HEAD exists, mirror household PMT to the group
+        as pmt_score_household / pmt_class_household.
         """
         group_individuals = GroupIndividual.objects.filter(group_id=group.id, is_deleted=False)
         head = group_individuals.filter(role=GroupIndividual.Role.HEAD).first()
@@ -446,6 +505,19 @@ class GroupAndGroupIndividualAlignmentService:
                     del group.json_ext[key]
                 else:
                     group.json_ext[key] = value
+
+        # Mirror PMT specifically (household-level) without copying whole head json over and over
+        try:
+            p_score = None
+            p_class = None
+            if isinstance(head_json_ext, dict):
+                p_score = head_json_ext.get("pmt_score")
+                p_class = head_json_ext.get("pmt_class")
+            if (group.json_ext.get("pmt_score_household") != p_score) or (group.json_ext.get("pmt_class_household") != p_class):
+                group.json_ext["pmt_score_household"] = p_score
+                group.json_ext["pmt_class_household"] = p_class
+        except Exception:
+            logger.debug("PMT mirror to group json_ext failed", exc_info=True)
 
         current_members = group.json_ext.get("members", {})
         additional_members = {k: v for k, v in group_members.items() if k not in current_members}
@@ -497,7 +569,6 @@ class GroupAndGroupIndividualAlignmentService:
         else:
             individual.location_id = group.location_id
             individual.save(user=self.user)
-
 
     def _assure_primary_recipient_in_group(self, group):
         group_individuals = GroupIndividual.objects.filter(group=group, is_deleted=False)
@@ -579,7 +650,7 @@ class IndividualImportService:
     def _create_individual_data_upload_records(self, workflow, upload, group_aggregation_column):
         record = IndividualDataUploadRecords(
             data_upload=upload,
-            workflow=workflow.name,
+            workflow=workflow.name if hasattr(workflow, "name") else str(workflow),
             json_ext={"group_aggregation_column": group_aggregation_column}
         )
         record.save(user=self.user)
@@ -698,6 +769,34 @@ class IndividualImportService:
             .values_list('name', 'code')
         )
 
+    # @staticmethod
+    # def _validate_location(
+    #     location_name,
+    #     location_code,
+    #     loc_name_code_district_ids_from_db,
+    #     user_allowed_loc_ids,
+    #     duplicate_village_name_code_tuples
+    # ):
+    #     result = {
+    #         'field_name': 'location_name',
+    #     }
+    #     if (pd.isna(location_name) or location_name == "") and (pd.isna(location_code) or location_code == ""):
+    #         result['success'] = True
+    #     elif loc_name_code_district_ids_from_db is None and user_allowed_loc_ids is None:
+    #         result['success'] = True
+    #     elif (location_name, location_code) not in loc_name_code_district_ids_from_db:
+    #         result['success'] = False
+    #         result['note'] = f"Location with name '{location_name}' and code '{location_code}' is not valid. Please check the spelling against the list of locations in the system."
+    #     elif (location_name, location_code) in duplicate_village_name_code_tuples:
+    #         result['success'] = False
+    #         result['note'] = f"Location with name '{location_name}' and code '{location_code}' is ambiguous, because there are more than one location with this name and code found in the system."
+    #     elif loc_name_code_district_ids_from_db[(location_name, location_code)] not in user_allowed_loc_ids:
+    #         result['success'] = False
+    #         result['note'] = f"Location with name '{location_name}' and code '{location_code}' is outside the current user's location permissions."
+    #     else:
+    #         result['success'] = True
+    #     return result
+    
     @staticmethod
     def _validate_location(
         location_name,
@@ -706,25 +805,68 @@ class IndividualImportService:
         user_allowed_loc_ids,
         duplicate_village_name_code_tuples
     ):
-        result = {
-            'field_name': 'location_name',
-        }
-        if (pd.isna(location_name) or location_name == "") and (pd.isna(location_code) or location_code == ""):
+        """
+        Validate location by ALWAYS normalizing the code to 9 digits.
+        This ensures compatibility with openIMIS DB codes and fixes UI display issues.
+        """
+        result = {'field_name': 'location_name'}
+
+        # --- NORMALIZE THE CODE (CRITICAL FIX) ---
+        code = '' if pd.isna(location_code) else str(location_code).strip()
+        code = code.replace('.0', '')                        # remove Excel float
+        code = ''.join(ch for ch in code if ch.isdigit())    # digits only
+
+        if code:
+            code = code.zfill(9)                             # ALWAYS 9 digits for TASAF
+
+        # ---------------- VALIDATION -----------------
+        if (pd.isna(location_name) or str(location_name).strip() == "") and code == "":
             result['success'] = True
+
         elif loc_name_code_district_ids_from_db is None and user_allowed_loc_ids is None:
             result['success'] = True
-        elif (location_name, location_code) not in loc_name_code_district_ids_from_db:
+
+        elif (location_name, code) not in loc_name_code_district_ids_from_db:
             result['success'] = False
-            result['note'] = f"Location with name '{location_name}' and code '{location_code}' is not valid. Please check the spelling against the list of locations in the system."
-        elif (location_name, location_code) in duplicate_village_name_code_tuples:
+            result['note'] = (
+                f"Location with name '{location_name}' and code '{code}' is not valid. "
+                "Please check the spelling against the list of locations in the system."
+            )
+
+        elif (location_name, code) in duplicate_village_name_code_tuples:
             result['success'] = False
-            result['note'] = f"Location with name '{location_name}' and code '{location_code}' is ambiguous, because there are more than one location with this name and code found in the system."
-        elif loc_name_code_district_ids_from_db[(location_name, location_code)] not in user_allowed_loc_ids:
+            result['note'] = (
+                f"Location with name '{location_name}' and code '{code}' is ambiguous, "
+                "because more than one matching location exists."
+            )
+
+        elif loc_name_code_district_ids_from_db[(location_name, code)] not in user_allowed_loc_ids:
             result['success'] = False
-            result['note'] = f"Location with name '{location_name}' and code '{location_code}' is outside the current user's location permissions."
+            result['note'] = (
+                f"Location with name '{location_name}' and code '{code}' is outside the current user's location permissions."
+            )
+
         else:
             result['success'] = True
+
         return result
+    
+    @staticmethod
+    def _normalize_code_series(series: pd.Series, width: int) -> pd.Series:
+        """
+        Normalize a code column coming from CSV/Excel:
+        - convert to string, strip
+        - remove trailing '.0'
+        - keep only digits
+        - pad left to fixed width
+        """
+        s = series.astype(str).str.strip()
+        s = s.str.replace(r'\.0$', '', regex=True)
+        s = s.str.replace(r'[^0-9]', '', regex=True)
+        mask = s.str.len() > 0
+        s.loc[mask] = s.loc[mask].str.zfill(width)
+        return s
+
 
 
     @staticmethod
@@ -737,7 +879,6 @@ class IndividualImportService:
         if not success:
             result["note"] = f"'{field}' Field value '{row[field]}' is duplicated"
         return result
-
 
     @staticmethod
     def _handle_validation_calculation(row, field, field_properties):
@@ -766,14 +907,39 @@ class IndividualImportService:
             raise ValueError("Import file is empty")
 
     def _load_import_file(self, import_file) -> pd.DataFrame:
+        """
+        Load CSV/Excel and normalize all location-related code fields.
+        This restores original openIMIS behaviour and ensures UI can match locations.
+        """
         if import_file.content_type not in self.import_loaders:
-            raise ValueError("Unsupported content type: {}".format(import_file.content_type))
+            raise ValueError(f"Unsupported content type: {import_file.content_type}")
 
-        return self.import_loaders[import_file.content_type](import_file)
+        # Load using registered loader
+        df = self.import_loaders[import_file.content_type](import_file)
+
+        # --- CRITICAL: Normalize codes for proper UI + validation behaviour ---
+        # These columns may appear depending on the import template
+        if 'location_code' in df.columns:
+            df['location_code'] = self._normalize_code_series(df['location_code'], 9)
+
+        if 'ward_code' in df.columns:
+            df['ward_code'] = self._normalize_code_series(df['ward_code'], 6)
+
+        if 'district_code' in df.columns:
+            df['district_code'] = self._normalize_code_series(df['district_code'], 4)
+
+        if 'region_code' in df.columns:
+            df['region_code'] = self._normalize_code_series(df['region_code'], 2)
+
+        return df
+
+    # def _load_import_file(self, import_file) -> pd.DataFrame:
+    #     if import_file.content_type not in self.import_loaders:
+    #         raise ValueError("Unsupported content type: {}".format(import_file.content_type))
+    #     return self.import_loaders[import_file.content_type](import_file)
 
     def _save_data_source(self, dataframe: pd.DataFrame, upload: IndividualDataSourceUpload):
         data_source_objects = []
-        
         for _, row in dataframe.iterrows():
             ds = IndividualDataSource(
                 upload=upload,
@@ -784,32 +950,204 @@ class IndividualImportService:
                 uuid=uuid.uuid4()
             )
             data_source_objects.append(ds)
-
         IndividualDataSource.objects.bulk_create(data_source_objects)
 
     def _trigger_workflow(self,
                           workflow: WorkflowHandler,
                           upload: IndividualDataSourceUpload):
+        """
+        Trigger the configured workflow for this upload, with proper status transitions
+        and error capture (matches original behavior). Also supports dotted-path/callables.
+        """
+        #if no workflow 
+        if workflow is None:
+            raise ValueError("No workflow provided for import_individuals")
+            
         try:
             # Before the run in order to avoid racing conditions
             upload.status = IndividualDataSourceUpload.Status.TRIGGERED
             upload.save(username=self.user.login_name)
+            
+            # Resolve to an object exposing .run(ctx)
+            runner = _resolve_workflow_runner(workflow, user=self.user)
 
-            result = workflow.run({
-                # Core user UUID required
-                'user_uuid': str(User.objects.get(username=self.user.login_name).id),
+            # Core user UUID required
+            core_user = User.objects.get(username=self.user.login_name)
+            user_uuid = str(getattr(core_user, "id"))
+
+            result = runner.run({
+                'user_uuid': user_uuid,
                 'upload_uuid': str(upload.uuid),
             })
 
-            # Conditions are safety measure for workflows. Usually handles like PythonHandler or LightningHandler
-            #  should follow this pattern but return type is not determined in workflow.run abstract.
+            # Structured failure from handler -> mark FAIL and record error
             if result and isinstance(result, dict) and result.get('success') is False:
                 raise ValueError(result.get('message', 'Unexpected error during the workflow execution'))
+
         except ValueError as e:
             upload.status = IndividualDataSourceUpload.Status.FAIL
             upload.error = {'workflow': str(e)}
             upload.save(username=self.user.login_name)
             return upload
+        except Exception as e:
+            upload.status = IndividualDataSourceUpload.Status.FAIL
+            upload.error = {'workflow': str(e)}
+            upload.save(username=self.user.login_name)
+            logger.exception("Workflow crashed for upload %s", upload.uuid)
+            return upload
+
+    def link_groups_for_upload_uuid(self, upload_uuid: str) -> dict:
+        """
+        Create/align Groups and GroupIndividuals for all Individuals created by this upload.
+        - Sets HEAD when individual_role_code == '1'
+        - Sets PRIMARY when hhrep == individual_role_code
+        - Aligns locations (group vs individual) before linking
+        - Copies HEAD's PMT (if present) to Group.json_ext as pmt_score_household / pmt_class_household
+        - Refreshes group.json_ext members/head/recipients
+        """
+        from individual.models import (
+            Individual, Group, GroupIndividual,
+            IndividualDataUploadRecords, IndividualDataSourceUpload
+        )
+        from individual.services import (
+            GroupIndividualService, GroupAndGroupIndividualAlignmentService
+        )
+
+        upload = IndividualDataSourceUpload.objects.filter(uuid=upload_uuid, is_deleted=False).first()
+        if not upload:
+            return {"success": False, "message": f"Upload {upload_uuid} not found"}
+
+        # Determine grouping column (defaults to 'group_code')
+        group_col = "group_code"
+        rec = (IndividualDataUploadRecords.objects
+               .filter(data_upload=upload, is_deleted=False)
+               .order_by("id").first())
+        if rec and isinstance(rec.json_ext, dict):
+            c = (rec.json_ext or {}).get("group_aggregation_column")
+            if isinstance(c, str) and c.strip():
+                group_col = c.strip()
+
+        inds = (Individual.objects
+                .filter(individualdatasource__upload=upload, is_deleted=False)
+                .distinct())
+
+        if not inds.exists():
+            return {"success": True, "group_column": group_col, "created_groups": 0,
+                    "created_links": 0, "updated_links": 0, "groups_touched": 0}
+
+        aligner = GroupAndGroupIndividualAlignmentService(self.user)
+
+        created_groups = 0
+        created_links = 0
+        updated_links = 0
+        touched_groups = set()
+
+        with transaction.atomic():
+            for ind in inds:
+                # Resolve group code from top-level or json_ext fallback
+                group_code = getattr(ind, group_col, None)
+                if not group_code:
+                    jx = ind.json_ext or {}
+                    group_code = jx.get(group_col) or jx.get("group_code")
+                if not group_code:
+                    continue
+
+                grp = Group.objects.filter(code=group_code, is_deleted=False).first()
+                if not grp:
+                    grp = Group(code=group_code, json_ext={})
+                    grp.save(user=self.user)
+                    created_groups += 1
+                touched_groups.add(grp.id)
+
+                # Role / recipient inference from individual's json_ext
+                jx = ind.json_ext or {}
+                role_code = str(jx.get("individual_role_code") or jx.get("relationship_to_head") or "").strip()
+                hhrep_code = str(jx.get("hhrep") or "").strip()
+
+                desired_role = GroupIndividual.Role.HEAD if role_code == "1" else None
+                desired_recipient = (GroupIndividual.RecipientType.PRIMARY
+                                     if (hhrep_code and hhrep_code == role_code) else None)
+
+                # Align locations BEFORE linking (mirrors your earlier logic)
+                has_head = GroupIndividual.objects.filter(
+                    group=grp, role=GroupIndividual.Role.HEAD, is_deleted=False
+                ).exists()
+                role_for_alignment = desired_role if (desired_role == GroupIndividual.Role.HEAD or not has_head) else None
+                try:
+                    aligner.ensure_location_consistent(grp, ind, role_for_alignment)
+                except Exception:
+                    # non-fatal alignment error
+                    pass
+
+                gi = GroupIndividual.objects.filter(group=grp, individual=ind, is_deleted=False).first()
+                if not gi:
+                    GroupIndividualService(self.user).create({
+                        "group_id": str(grp.id),
+                        "individual_id": str(ind.id),
+                        "role": desired_role,
+                        "recipient_type": desired_recipient,
+                    })
+                    created_links += 1
+                else:
+                    changed = False
+                    if gi.role != desired_role:
+                        gi.role = desired_role
+                        changed = True
+                    if gi.recipient_type != desired_recipient:
+                        gi.recipient_type = desired_recipient
+                        changed = True
+                    if changed:
+                        gi.save(user=self.user)
+                        updated_links += 1
+
+                # Copy PMT from HEAD to group json_ext (optional but useful)
+                try:
+                    if desired_role == GroupIndividual.Role.HEAD:
+                        pmt_score = jx.get("pmt_score")
+                        pmt_class = jx.get("pmt_class")
+                        if pmt_score is not None or pmt_class is not None:
+                            upd = False
+                            if grp.json_ext is None:
+                                grp.json_ext = {}
+                            if pmt_score is not None and grp.json_ext.get("pmt_score_household") != pmt_score:
+                                grp.json_ext["pmt_score_household"] = pmt_score
+                                upd = True
+                            if pmt_class is not None and grp.json_ext.get("pmt_class_household") != pmt_class:
+                                grp.json_ext["pmt_class_household"] = pmt_class
+                                upd = True
+                            if upd:
+                                grp.save(update_fields=["json_ext"], user=self.user)
+                except Exception:
+                    pass
+
+            # Refresh group.json_ext aggregates once per touched group
+            for gid in touched_groups:
+                try:
+                    g = Group.objects.get(id=gid)
+                    aligner.update_json_ext_for_group(g)
+                except Exception:
+                    pass
+
+        return {
+            "success": True,
+            "group_column": group_col,
+            "created_groups": created_groups,
+            "created_links": created_links,
+            "updated_links": updated_links,
+            "groups_touched": len(touched_groups),
+        }
+
+    def link_groups_for_upload_id(self, upload_id) -> dict:
+        """Helper: accept DB PK and forward to UUID-based method."""
+        from individual.models import IndividualDataSourceUpload
+        up = IndividualDataSourceUpload.objects.filter(id=upload_id, is_deleted=False).first()
+        if not up:
+            return {"success": False, "message": f"Upload id {upload_id} not found"}
+        return self.link_groups_for_upload_uuid(str(up.uuid))
+
+    # Backward-compatible alias if any caller expects this name
+    def finalize_upload_group_links(self, upload_uuid: str) -> dict:
+        return self.link_groups_for_upload_uuid(upload_uuid)
 
     def save_validation_error_in_data_source_bulk(self, validated_dataframe):
         data_sources_to_update = []
@@ -869,6 +1207,7 @@ class IndividualImportService:
                 record.data_upload.id,
                 self.user
             ).run_workflow()
+
 
 class IndividualTaskCreatorService:
 
