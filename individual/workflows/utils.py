@@ -51,7 +51,31 @@ class BasePythonWorkflowExecutor(metaclass=ABCMeta):
         """
         df_headers = set(self.df.columns)
         schema_properties = set(self.schema.get('properties', {}).keys())
-        schema_properties.update(['recipient_info', 'group_code', 'individual_role'])
+        schema_properties.update([
+            'recipient_info',
+            'individual_role',
+
+            # Household / grouping fields from adapter
+            'group_code',
+            'individual_role_code',
+            'hhrep',
+
+            # Identifiers
+            'interview_key',
+            'external_id',
+
+            # PMT fields (enriched later)
+            'pmt_score',
+            'pmt_class',
+
+            # Flat + convenience fields
+            'json_ext',
+            'gender',
+            'phone',
+            'email',
+            'location_name',
+            'location_code',
+        ])
         required_headers = set(IndividualConfig.individual_base_fields)
         if is_update:
             required_headers.add('ID')
