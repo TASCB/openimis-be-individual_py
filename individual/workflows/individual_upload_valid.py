@@ -1,10 +1,12 @@
 import logging
 
 from core.models import User
+from core.utils import set_current_user, clear_current_user
 from individual.workflows.utils import SqlProcedurePythonWorkflow
 from individual.services import IndividualImportService
 
 logger = logging.getLogger(__name__)
+
 
 def process_import_valid_individuals_workflow(user_uuid, upload_uuid, accepted=None):
     """
@@ -15,56 +17,36 @@ def process_import_valid_individuals_workflow(user_uuid, upload_uuid, accepted=N
       - Link Groups by group_code / hhrep (HEAD/PRIMARY)
     """
     user = User.objects.get(id=user_uuid)
-    service = SqlProcedurePythonWorkflow(upload_uuid, user_uuid, accepted)
-    service.validate_dataframe_headers()
-
-    if isinstance(accepted, list):
-        service.execute(upload_sql_partial, [upload_uuid, user_uuid, accepted])
-    else:
-        service.execute(upload_sql, [upload_uuid, user_uuid])
-
-    # ---- reporting sync: MAKE NON-FATAL ----
+    set_current_user(user)
     try:
-        IndividualImportService(user).synchronize_data_for_reporting(upload_uuid)
-    except Exception as e:
-        logger.warning(
-            "Reporting sync failed for upload %s (ignored for ETL): %s",
-            upload_uuid,
-            e,
-            exc_info=True,
-        )
+        service = SqlProcedurePythonWorkflow(upload_uuid, user_uuid, accepted)
+        service.validate_dataframe_headers()
 
-    # ---- group wiring: MUST ALWAYS RUN ----
-    try:
-        IndividualImportService(user).link_groups_for_upload_uuid(str(upload_uuid))
-    except Exception as e:
-        logger.exception("Group linking failed for upload %s: %s", upload_uuid, e)
+        if isinstance(accepted, list):
+            service.execute(upload_sql_partial, [upload_uuid, user_uuid, accepted])
+        else:
+            service.execute(upload_sql, [upload_uuid, user_uuid])
 
-# def process_import_valid_individuals_workflow(user_uuid, upload_uuid, accepted=None):
-#     """
-#     Approve 'valid' rows in a given upload:
-#       - Insert brand-new Individuals
-#       - Link duplicates (by json_ext.external_id) to existing Individuals
-#       - Synchronize reporting
-#       - Link Groups by group_code / hhrep (HEAD/PRIMARY)
-#     """
-#     user = User.objects.get(id=user_uuid)
-#     service = SqlProcedurePythonWorkflow(upload_uuid, user_uuid, accepted)
-#     service.validate_dataframe_headers()
+        # ---- reporting sync: NON-FATAL ----
+        try:
+            IndividualImportService(user).synchronize_data_for_reporting(upload_uuid)
+        except Exception as e:
+            logger.warning(
+                "Reporting sync failed for upload %s (ignored for ETL): %s",
+                upload_uuid,
+                e,
+                exc_info=True,
+            )
 
-#     if isinstance(accepted, list):
-#         service.execute(upload_sql_partial, [upload_uuid, user_uuid, accepted])
-#     else:
-#         service.execute(upload_sql, [upload_uuid, user_uuid])
+        # ---- group wiring: MUST ALWAYS RUN ----
+        try:
+            IndividualImportService(user).link_groups_for_upload_uuid(str(upload_uuid))
+        except Exception as e:
+            logger.exception("Group linking failed for upload %s: %s", upload_uuid, e)
 
-#     # reporting sync
-#     IndividualImportService(user).synchronize_data_for_reporting(upload_uuid)
-
-#     # group wiring
-#     try:
-#         IndividualImportService(user).link_groups_for_upload_uuid(str(upload_uuid))
-#     except Exception as e:
-#         logger.exception("Group linking failed for upload %s: %s", upload_uuid, e)
+    finally:
+        # CLEANUP: Clear current user after workflow completes
+        clear_current_user()
 
 
 # INSERT all valid rows; then also link duplicates by external_id to existing Individuals

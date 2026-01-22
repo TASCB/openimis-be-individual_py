@@ -1,5 +1,3 @@
-# individual/services.py
-
 import logging
 import json
 import uuid
@@ -28,25 +26,34 @@ from individual.models import (
     GroupIndividual,
     Group,
     IndividualDataUploadRecords,
-    IndividualDataSourceUpload
+    IndividualDataSourceUpload,
 )
 from individual.utils import (
     load_dataframe,
     fetch_summary_of_valid_items,
-    fetch_summary_of_broken_items
+    fetch_summary_of_broken_items,
 )
 from individual.validation import (
     IndividualValidation,
     IndividualDataSourceValidation,
     GroupIndividualValidation,
-    GroupValidation, CrateGroupAndMoveIndividualValidation
+    GroupValidation,
+    CrateGroupAndMoveIndividualValidation,
 )
-from core.services.utils import check_authentication as check_authentication, output_exception, output_result_success, \
-    model_representation
+from core.services.utils import (
+    check_authentication as check_authentication,
+    output_exception,
+    output_result_success,
+    model_representation,
+)
 from location.models import Location, LocationManager
 from tasks_management.models import Task
-from tasks_management.services import UpdateCheckerLogicServiceMixin, CreateCheckerLogicServiceMixin, \
-    crud_business_data_builder, DeleteCheckerLogicServiceMixin
+from tasks_management.services import (
+    UpdateCheckerLogicServiceMixin,
+    CreateCheckerLogicServiceMixin,
+    crud_business_data_builder,
+    DeleteCheckerLogicServiceMixin,
+)
 from workflow.systems.base import WorkflowHandler
 
 logger = logging.getLogger(__name__)
@@ -55,9 +62,11 @@ logger = logging.getLogger(__name__)
 # ---------- helpers to allow dotted-path/callable workflows ----------
 class _SimpleRunner:
     """Wrap a function so it exposes .run(ctx)."""
+
     def __init__(self, fn, name="wrapped"):
         self._fn = fn
         self.name = name
+
     def run(self, ctx):
         sig = inspect.signature(self._fn)
         params = sig.parameters
@@ -70,6 +79,7 @@ class _SimpleRunner:
             return self._fn(user_uuid, upload_uuid, accepted=accepted)
         else:
             return self._fn(user_uuid, upload_uuid)
+
 
 def _resolve_workflow_runner(workflow, user=None):
     """
@@ -96,17 +106,24 @@ def _resolve_workflow_runner(workflow, user=None):
                 return _SimpleRunner(obj, name=workflow)
         except Exception:
             logger.exception("Failed to resolve workflow dotted path: %s", workflow)
+
     class _NoOp:
         def __init__(self, name="NOOP"):
             self.name = name
+
         def run(self, ctx):
-            logger.warning("NOOP workflow used; nothing executed. Name requested: %s", workflow)
+            logger.warning(
+                "NOOP workflow used; nothing executed. Name requested: %s", workflow
+            )
             return {"success": True, "detail": "noop"}
+
     return _NoOp(name=str(workflow))
 
 
-class IndividualService(BaseService, UpdateCheckerLogicServiceMixin, DeleteCheckerLogicServiceMixin):
-    @register_service_signal('individual_service.create')
+class IndividualService(
+    BaseService, UpdateCheckerLogicServiceMixin, DeleteCheckerLogicServiceMixin
+):
+    @register_service_signal("individual_service.create")
     def create(self, obj_data):
         return super().create(obj_data)
 
@@ -114,22 +131,22 @@ class IndividualService(BaseService, UpdateCheckerLogicServiceMixin, DeleteCheck
         self._update_json_ext(obj_data)
         return super().create_update_task(obj_data)
 
-    @register_service_signal('individual_service.update')
+    @register_service_signal("individual_service.update")
     def update(self, obj_data):
         self._update_json_ext(obj_data)
         return super().update(obj_data)
 
-    @register_service_signal('individual_service.delete')
+    @register_service_signal("individual_service.delete")
     def delete(self, obj_data):
         return super().delete(obj_data)
 
-    @register_service_signal('individual_service.undo_delete')
+    @register_service_signal("individual_service.undo_delete")
     @check_authentication
     def undo_delete(self, obj_data):
         try:
             with transaction.atomic():
                 self.validation_class.validate_undo_delete(obj_data)
-                obj_ = self.OBJECT_TYPE.objects.filter(id=obj_data['id']).first()
+                obj_ = self.OBJECT_TYPE.objects.filter(id=obj_data["id"]).first()
                 obj_.is_deleted = False
                 obj_.save(user=self.user)
                 return {
@@ -138,28 +155,45 @@ class IndividualService(BaseService, UpdateCheckerLogicServiceMixin, DeleteCheck
                     "detail": "Undo Delete",
                 }
         except Exception as exc:
-            return output_exception(model_name=self.OBJECT_TYPE.__name__, method="undo_delete", exception=exc)
+            return output_exception(
+                model_name=self.OBJECT_TYPE.__name__,
+                method="undo_delete",
+                exception=exc,
+            )
 
-    @register_service_signal('individual_service.select_individuals_to_benefit_plan')
-    def select_individuals_to_benefit_plan(self, custom_filters, benefit_plan_id, status, user):
+    @register_service_signal("individual_service.select_individuals_to_benefit_plan")
+    def select_individuals_to_benefit_plan(
+        self, custom_filters, benefit_plan_id, status, user
+    ):
         individual_query = Individual.objects.filter(is_deleted=False)
-        subquery = GroupIndividual.objects.filter(
-            individual=OuterRef('pk')
-        ).exclude(
-            is_deleted=True
-        ).values('individual')
-        individual_query_with_filters = CustomFilterWizardStorage.build_custom_filters_queryset(
-            "individual",
-            "Individual",
-            custom_filters,
-            individual_query,
+        subquery = (
+            GroupIndividual.objects.filter(individual=OuterRef("pk"))
+            .exclude(is_deleted=True)
+            .values("individual")
         )
-        individual_query_with_filters = individual_query_with_filters.filter(~Q(pk__in=Subquery(subquery))).distinct()
+        individual_query_with_filters = (
+            CustomFilterWizardStorage.build_custom_filters_queryset(
+                "individual",
+                "Individual",
+                custom_filters,
+                individual_query,
+            )
+        )
+        individual_query_with_filters = individual_query_with_filters.filter(
+            ~Q(pk__in=Subquery(subquery))
+        ).distinct()
         if benefit_plan_id:
-            individuals_assigned_to_selected_programme = individual_query_with_filters. \
-                filter(is_deleted=False, beneficiary__benefit_plan_id=benefit_plan_id)
-            individuals_not_assigned_to_selected_programme = individual_query_with_filters.exclude(
-                id__in=individuals_assigned_to_selected_programme.values_list('id', flat=True)
+            individuals_assigned_to_selected_programme = (
+                individual_query_with_filters.filter(
+                    is_deleted=False, beneficiary__benefit_plan_id=benefit_plan_id
+                )
+            )
+            individuals_not_assigned_to_selected_programme = (
+                individual_query_with_filters.exclude(
+                    id__in=individuals_assigned_to_selected_programme.values_list(
+                        "id", flat=True
+                    )
+                )
             )
             output = {
                 "individuals_assigned_to_selected_programme": individuals_assigned_to_selected_programme,
@@ -172,26 +206,26 @@ class IndividualService(BaseService, UpdateCheckerLogicServiceMixin, DeleteCheck
             return output
         return None
 
-    @register_service_signal('individual_service.create_accept_enrolment_task')
+    @register_service_signal("individual_service.create_accept_enrolment_task")
     def create_accept_enrolment_task(self, individual_queryset, benefit_plan_id):
         pass
 
     def _update_json_ext(self, obj_data):
-        if not obj_data or 'json_ext' not in obj_data or 'location_id' not in obj_data:
+        if not obj_data or "json_ext" not in obj_data or "location_id" not in obj_data:
             return
 
-        json_ext = obj_data['json_ext']
+        json_ext = obj_data["json_ext"]
         if not json_ext:
             return
 
-        location_id = obj_data['location_id']
+        location_id = obj_data["location_id"]
         if location_id:
             location = Location.objects.get(id=location_id)
-            json_ext['location_str'] = str(location)
+            json_ext["location_str"] = str(location)
         else:
-            json_ext['location_str'] = None
+            json_ext["location_str"] = None
 
-        obj_data['json_ext'] = json_ext
+        obj_data["json_ext"] = json_ext
 
     OBJECT_TYPE = Individual
 
@@ -200,15 +234,15 @@ class IndividualService(BaseService, UpdateCheckerLogicServiceMixin, DeleteCheck
 
 
 class IndividualDataSourceService(BaseService):
-    @register_service_signal('individual_data_source_service.create')
+    @register_service_signal("individual_data_source_service.create")
     def create(self, obj_data):
         return super().create(obj_data)
 
-    @register_service_signal('individual_data_source_service.update')
+    @register_service_signal("individual_data_source_service.update")
     def update(self, obj_data):
         return super().update(obj_data)
 
-    @register_service_signal('individual_data_source_service.delete')
+    @register_service_signal("individual_data_source_service.delete")
     def delete(self, obj_data):
         return super().delete(obj_data)
 
@@ -222,7 +256,7 @@ class GroupService(
     BaseService,
     CreateCheckerLogicServiceMixin,
     UpdateCheckerLogicServiceMixin,
-    DeleteCheckerLogicServiceMixin
+    DeleteCheckerLogicServiceMixin,
 ):
     OBJECT_TYPE = Group
 
@@ -230,78 +264,87 @@ class GroupService(
         super().__init__(user, validation_class)
 
     @check_authentication
-    @register_service_signal('group_service.create')
+    @register_service_signal("group_service.create")
     def create(self, obj_data):
         try:
             with transaction.atomic():
-                individuals_data = obj_data.pop('individuals_data', None)
+                individuals_data = obj_data.pop("individuals_data", None)
                 result = super().create(obj_data)
-                group_id = result.get('data', {}).get('id')
+                group_id = result.get("data", {}).get("id")
 
                 if not group_id:
                     return result
 
                 if individuals_data:
-                    individual_ids = [data["individual_id"] for data in individuals_data]
+                    individual_ids = [
+                        data["individual_id"] for data in individuals_data
+                    ]
                     self._update_group_json_ext(group_id, individual_ids)
                     for data in individuals_data:
                         obj_data = {
-                            'group_id': group_id,
-                            'individual_id': data.get("individual_id"),
-                            'role': data.get("role"),
-                            'recipient_type': data.get("recipient_type")
+                            "group_id": group_id,
+                            "individual_id": data.get("individual_id"),
+                            "role": data.get("role"),
+                            "recipient_type": data.get("recipient_type"),
                         }
                         service = GroupIndividualService(self.user)
                         service.create(obj_data)
                 return result
         except Exception as exc:
-            return output_exception(model_name=self.OBJECT_TYPE.__name__, method="create", exception=exc)
+            return output_exception(
+                model_name=self.OBJECT_TYPE.__name__, method="create", exception=exc
+            )
 
     @check_authentication
-    @register_service_signal('group_service.update')
+    @register_service_signal("group_service.update")
     def update(self, obj_data):
         try:
             with transaction.atomic():
-                individuals_data = obj_data.pop('individuals_data', None)
+                individuals_data = obj_data.pop("individuals_data", None)
                 result = super().update(obj_data)
 
                 if not individuals_data:
                     return result
 
-                group_id = obj_data['id']
-                assigned_individuals_ids = \
-                    GroupIndividual.objects.filter(group_id=group_id).values_list('individual_id', flat=True)
+                group_id = obj_data["id"]
+                assigned_individuals_ids = GroupIndividual.objects.filter(
+                    group_id=group_id
+                ).values_list("individual_id", flat=True)
 
                 service = GroupIndividualService(self.user)
-                individual_ids = [data['individual_id'] for data in individuals_data]
+                individual_ids = [data["individual_id"] for data in individuals_data]
                 group = self._update_group_json_ext(group_id, individual_ids)
 
                 for individual_id in assigned_individuals_ids:
                     if str(individual_id) not in individual_ids:
-                        group_individual = GroupIndividual.objects.get(group_id=group_id, individual_id=individual_id)
-                        service.delete({'id': group_individual.id})
+                        group_individual = GroupIndividual.objects.get(
+                            group_id=group_id, individual_id=individual_id
+                        )
+                        service.delete({"id": group_individual.id})
 
                 for data in individuals_data:
                     if uuid.UUID(data["individual_id"]) not in assigned_individuals_ids:
                         obj_data = {
-                            'group_id': group_id,
-                            'individual_id': data.get("individual_id"),
-                            'role': data.get("role"),
-                            'recipient_type': data.get("recipient_type")
+                            "group_id": group_id,
+                            "individual_id": data.get("individual_id"),
+                            "role": data.get("role"),
+                            "recipient_type": data.get("recipient_type"),
                         }
                         service.create(obj_data)
 
                 dict_repr = model_representation(group)
                 return output_result_success(dict_representation=dict_repr)
         except Exception as exc:
-            return output_exception(model_name=self.OBJECT_TYPE.__name__, method="update", exception=exc)
+            return output_exception(
+                model_name=self.OBJECT_TYPE.__name__, method="update", exception=exc
+            )
 
-    @register_service_signal('group_service.delete')
+    @register_service_signal("group_service.delete")
     def delete(self, obj_data):
         # if there ever was a requirement to undo group delete, remember to use members from json_ext, you will avoid
         # adding individuals that had been deleted from the group before group deletion
         with transaction.atomic():
-            group_id = obj_data.get('id')
+            group_id = obj_data.get("id")
             group_individuals = GroupIndividual.objects.filter(group_id=group_id)
             for group_individual in group_individuals:
                 # cant use .delete() on query since it will completely remove instances from db instead of marking
@@ -322,21 +365,30 @@ class GroupService(
         group.save(user=self.user)
         return group
 
-    @register_service_signal('group_service.select_groups_to_benefit_plan')
-    def select_groups_to_benefit_plan(self, custom_filters, benefit_plan_id, status, user):
+    @register_service_signal("group_service.select_groups_to_benefit_plan")
+    def select_groups_to_benefit_plan(
+        self, custom_filters, benefit_plan_id, status, user
+    ):
         group_query = Group.objects.filter(is_deleted=False)
         # criteria will be based on head of the group
-        group_query_with_filters = CustomFilterWizardStorage.build_custom_filters_queryset(
-            "individual",
-            "Group",
-            custom_filters,
-            group_query,
+        group_query_with_filters = (
+            CustomFilterWizardStorage.build_custom_filters_queryset(
+                "individual",
+                "Group",
+                custom_filters,
+                group_query,
+            )
         )
         if benefit_plan_id:
-            groups_assigned_to_selected_programme = group_query_with_filters. \
-                filter(is_deleted=False, groupbeneficiary__benefit_plan_id=benefit_plan_id)
-            groups_not_assigned_to_selected_programme = group_query_with_filters.exclude(
-                id__in=groups_assigned_to_selected_programme.values_list('id', flat=True)
+            groups_assigned_to_selected_programme = group_query_with_filters.filter(
+                is_deleted=False, groupbeneficiary__benefit_plan_id=benefit_plan_id
+            )
+            groups_not_assigned_to_selected_programme = (
+                group_query_with_filters.exclude(
+                    id__in=groups_assigned_to_selected_programme.values_list(
+                        "id", flat=True
+                    )
+                )
             )
             output = {
                 "groups_assigned_to_selected_programme": groups_assigned_to_selected_programme,
@@ -358,37 +410,47 @@ class CreateGroupAndMoveIndividualService(CreateCheckerLogicServiceMixin):
         self.validation_class = validation_class
 
     @check_authentication
-    @register_service_signal('create_group_and_move_individual.create')
+    @register_service_signal("create_group_and_move_individual.create")
     def create(self, obj_data):
         try:
             with transaction.atomic():
-                self.validation_class.validate_create_group_and_move_individual(self.user, **obj_data)
-                group_individual_id = obj_data.pop('group_individual_id')
+                self.validation_class.validate_create_group_and_move_individual(
+                    self.user, **obj_data
+                )
+                group_individual_id = obj_data.pop("group_individual_id")
                 group = GroupService(self.user).create(obj_data)
                 # return group if it has errors
-                if not group['data']:
+                if not group["data"]:
                     return group
-                group_individual = GroupIndividual.objects.filter(id=group_individual_id).first()
-                group_id = group['data']['id']
+                group_individual = GroupIndividual.objects.filter(
+                    id=group_individual_id
+                ).first()
+                group_id = group["data"]["id"]
                 service = GroupIndividualService(self.user)
-                service.update({
-                    'group_id': group_id, "id": group_individual_id, "role": group_individual.role
-                })
-                group_and_individuals_message = {**group, 'detail': group_individual_id}
+                service.update(
+                    {
+                        "group_id": group_id,
+                        "id": group_individual_id,
+                        "role": group_individual.role,
+                    }
+                )
+                group_and_individuals_message = {**group, "detail": group_individual_id}
                 return group_and_individuals_message
         except Exception as exc:
-            return output_exception(model_name=self.OBJECT_TYPE.__name__, method="create", exception=exc)
+            return output_exception(
+                model_name=self.OBJECT_TYPE.__name__, method="create", exception=exc
+            )
 
     def _business_data_serializer(self, data):
         def serialize(key, value):
-            if key == 'group_individual_id':
+            if key == "group_individual_id":
                 group_individual = GroupIndividual.objects.get(id=value)
-                return f'{group_individual.individual.first_name} {group_individual.individual.last_name}'
+                return f"{group_individual.individual.first_name} {group_individual.individual.last_name}"
             return value
 
         serialized_data = crud_business_data_builder(data, serialize)
         # TODO change to group code
-        serialized_data['incoming_data']["id"] = 'NEW_GROUP'
+        serialized_data["incoming_data"]["id"] = "NEW_GROUP"
         return serialized_data
 
 
@@ -398,43 +460,49 @@ class GroupIndividualService(BaseService, UpdateCheckerLogicServiceMixin):
     def __init__(self, user, validation_class=GroupIndividualValidation):
         super().__init__(user, validation_class)
 
-    @register_service_signal('groupindividual_service.create')
+    @register_service_signal("groupindividual_service.create")
     def create(self, obj_data):
         return super().create(obj_data)
 
     @check_authentication
-    @register_service_signal('groupindividual_service.update')
+    @register_service_signal("groupindividual_service.update")
     def update(self, obj_data):
         try:
             with transaction.atomic():
-                group_individual_id = obj_data.get('id')
-                incoming_group_id = obj_data.get('group_id')
-                group_individual = GroupIndividual.objects.filter(id=group_individual_id, is_deleted=False).first()
+                group_individual_id = obj_data.get("id")
+                incoming_group_id = obj_data.get("group_id")
+                group_individual = GroupIndividual.objects.filter(
+                    id=group_individual_id, is_deleted=False
+                ).first()
                 if not group_individual:
-                    raise ValueError(f"no GroupIndividual found with this id {group_individual_id}")
+                    raise ValueError(
+                        f"no GroupIndividual found with this id {group_individual_id}"
+                    )
 
                 if str(group_individual.group.id) == str(incoming_group_id):
                     return super().update(obj_data)
 
-                obj_data.pop('id', None)
-                obj_data.pop('recipient_type', None)
-                obj_data.pop('role', None)
+                obj_data.pop("id", None)
+                obj_data.pop("recipient_type", None)
+                obj_data.pop("role", None)
                 result = self.create(obj_data)
-                self.delete({'id': group_individual_id})
+                self.delete({"id": group_individual_id})
                 return result
         except Exception as exc:
-            return output_exception(model_name=self.OBJECT_TYPE.__name__, method="update", exception=exc)
+            return output_exception(
+                model_name=self.OBJECT_TYPE.__name__, method="update", exception=exc
+            )
 
-    @register_service_signal('groupindividual_service.delete')
+    @register_service_signal("groupindividual_service.delete")
     def delete(self, obj_data):
         return super().delete(obj_data)
 
     def _business_data_serializer(self, data):
         def serialize(key, value):
-            if key == 'id':
+            if key == "id":
                 group_individual = GroupIndividual.objects.get(id=value)
-                return f'{group_individual.individual.first_name} {group_individual.individual.last_name}'
-            if key == 'group_id':
+                return f"{group_individual.individual.first_name} {group_individual.individual.last_name}"
+            if key == "group_id":
                 group = Group.objects.get(id=value)
                 return group.code
             return value
@@ -445,7 +513,7 @@ class GroupIndividualService(BaseService, UpdateCheckerLogicServiceMixin):
 
 class GroupAndGroupIndividualAlignmentService:
     """
-        Service used in overridden .save() of GroupIndividual model.
+    Service used in overridden .save() of GroupIndividual model.
     """
 
     def __init__(self, user):
@@ -453,14 +521,16 @@ class GroupAndGroupIndividualAlignmentService:
 
     def handle_head_change(self, group_individual_id, role, group_id):
         """
-            Method used for making sure that during head change, the old one is set to default role.
+        Method used for making sure that during head change, the old one is set to default role.
         """
         if role == GroupIndividual.Role.HEAD:
             self._change_head(group_individual_id, group_id)
 
-    def handle_primary_recipient_change(self, group_individual_id, recipient_type, group_id):
+    def handle_primary_recipient_change(
+        self, group_individual_id, recipient_type, group_id
+    ):
         """
-            Method used for making sure that during primary recipient change, the old one is set to default role.
+        Method used for making sure that during primary recipient change, the old one is set to default role.
         """
         if recipient_type == GroupIndividual.RecipientType.PRIMARY:
             self._change_primary(group_individual_id, group_id)
@@ -471,31 +541,63 @@ class GroupAndGroupIndividualAlignmentService:
         Also (non-breaking enhancement): if a HEAD exists, mirror household PMT to the group
         as pmt_score_household / pmt_class_household.
         """
-        group_individuals = GroupIndividual.objects.filter(group_id=group.id, is_deleted=False)
+        group_individuals = GroupIndividual.objects.filter(
+            group_id=group.id, is_deleted=False
+        )
         head = group_individuals.filter(role=GroupIndividual.Role.HEAD).first()
-        primary = group_individuals.filter(recipient_type=GroupIndividual.RecipientType.PRIMARY).first()
-        secondary = group_individuals.filter(recipient_type=GroupIndividual.RecipientType.SECONDARY).first()
+        primary = group_individuals.filter(
+            recipient_type=GroupIndividual.RecipientType.PRIMARY
+        ).first()
+        secondary = group_individuals.filter(
+            recipient_type=GroupIndividual.RecipientType.SECONDARY
+        ).first()
 
         group_members = {
-            str(individual.individual.id): f"{individual.individual.first_name} {individual.individual.last_name}"
+            str(
+                individual.individual.id
+            ): f"{individual.individual.first_name} {individual.individual.last_name}"
             for individual in group_individuals
         }
 
-        head_str = f'{head.individual.first_name} {head.individual.last_name}' if head else None
+        head_str = (
+            f"{head.individual.first_name} {head.individual.last_name}"
+            if head
+            else None
+        )
         head_id = str(head.individual.id) if head else None
-        head_json_ext = head.individual.json_ext if head and head.individual.json_ext else {}
+        head_json_ext = (
+            head.individual.json_ext if head and head.individual.json_ext else {}
+        )
 
-        primary_str = f'{primary.individual.first_name} {primary.individual.last_name}' if primary else None
+        primary_str = (
+            f"{primary.individual.first_name} {primary.individual.last_name}"
+            if primary
+            else None
+        )
         primary_id = str(primary.individual.id) if primary else None
 
-        secondary_str = f'{secondary.individual.first_name} {secondary.individual.last_name}' if secondary else None
+        secondary_str = (
+            f"{secondary.individual.first_name} {secondary.individual.last_name}"
+            if secondary
+            else None
+        )
         secondary_id = str(secondary.individual.id) if secondary else None
 
         changes_to_save = {}
-        json_ext_minus_keys = {k: v for k, v in group.json_ext.items() if k not in [
-            "members", "head", "head_id", "primary_recipient",
-            "primary_recipient_id", "secondary_recipient", "secondary_recipient_id"
-        ]}
+        json_ext_minus_keys = {
+            k: v
+            for k, v in group.json_ext.items()
+            if k
+            not in [
+                "members",
+                "head",
+                "head_id",
+                "primary_recipient",
+                "primary_recipient_id",
+                "secondary_recipient",
+                "secondary_recipient_id",
+            ]
+        }
 
         if json_ext_minus_keys != head_json_ext:
             all_keys = set(head_json_ext.keys()).union(json_ext_minus_keys.keys())
@@ -513,15 +615,21 @@ class GroupAndGroupIndividualAlignmentService:
             if isinstance(head_json_ext, dict):
                 p_score = head_json_ext.get("pmt_score")
                 p_class = head_json_ext.get("pmt_class")
-            if (group.json_ext.get("pmt_score_household") != p_score) or (group.json_ext.get("pmt_class_household") != p_class):
+            if (group.json_ext.get("pmt_score_household") != p_score) or (
+                group.json_ext.get("pmt_class_household") != p_class
+            ):
                 group.json_ext["pmt_score_household"] = p_score
                 group.json_ext["pmt_class_household"] = p_class
         except Exception:
             logger.debug("PMT mirror to group json_ext failed", exc_info=True)
 
         current_members = group.json_ext.get("members", {})
-        additional_members = {k: v for k, v in group_members.items() if k not in current_members}
-        remove_members = {k: v for k, v in current_members.items() if k not in group_members}
+        additional_members = {
+            k: v for k, v in group_members.items() if k not in current_members
+        }
+        remove_members = {
+            k: v for k, v in current_members.items() if k not in group_members
+        }
         updated_members = {**current_members, **additional_members}
         for member_id in remove_members:
             updated_members.pop(member_id, None)
@@ -549,11 +657,11 @@ class GroupAndGroupIndividualAlignmentService:
 
         if changes_to_save:
             group.json_ext.update(changes_to_save)
-            group.save(update_fields=['json_ext'], user=self.user)
+            group.save(update_fields=["json_ext"], user=self.user)
 
     def handle_assure_primary_recipient_in_group(self, group, recipient_type):
         """
-            Making sure that group has a head.
+        Making sure that group has a head.
         """
         if recipient_type == GroupIndividual.RecipientType.PRIMARY:
             return
@@ -571,8 +679,12 @@ class GroupAndGroupIndividualAlignmentService:
             individual.save(user=self.user)
 
     def _assure_primary_recipient_in_group(self, group):
-        group_individuals = GroupIndividual.objects.filter(group=group, is_deleted=False)
-        primary_exists = group_individuals.filter(recipient_type=GroupIndividual.RecipientType.PRIMARY).exists()
+        group_individuals = GroupIndividual.objects.filter(
+            group=group, is_deleted=False
+        )
+        primary_exists = group_individuals.filter(
+            recipient_type=GroupIndividual.RecipientType.PRIMARY
+        ).exists()
         head_exists = group_individuals.filter(role=GroupIndividual.Role.HEAD).exists()
 
         if primary_exists:
@@ -589,7 +701,9 @@ class GroupAndGroupIndividualAlignmentService:
         new_primary.save(user=self.user)
 
     def _change_head(self, group_individual_id, group_id):
-        heads_queryset = GroupIndividual.objects.filter(group_id=group_id, role=GroupIndividual.Role.HEAD)
+        heads_queryset = GroupIndividual.objects.filter(
+            group_id=group_id, role=GroupIndividual.Role.HEAD
+        )
         old_head = heads_queryset.exclude(id=group_individual_id).first()
 
         if not old_head:
@@ -614,28 +728,34 @@ class GroupAndGroupIndividualAlignmentService:
 class IndividualImportService:
     import_loaders = {
         # .csv
-        'text/csv': lambda f: pd.read_csv(f),
+        "text/csv": lambda f: pd.read_csv(f),
         # .xlsx
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': lambda f: pd.read_excel(f),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": lambda f: pd.read_excel(
+            f
+        ),
         # .xls
-        'application/vnd.ms-excel': lambda f: pd.read_excel(f),
+        "application/vnd.ms-excel": lambda f: pd.read_excel(f),
         # .ods
-        'application/vnd.oasis.opendocument.spreadsheet': lambda f: pd.read_excel(f),
+        "application/vnd.oasis.opendocument.spreadsheet": lambda f: pd.read_excel(f),
     }
 
     def __init__(self, user):
         super().__init__()
         self.user = user
 
-    @register_service_signal('individual.import_individuals')
-    def import_individuals(self,
-                           import_file: InMemoryUploadedFile,
-                           workflow: WorkflowHandler,
-                           group_aggregation_column: str):
+    @register_service_signal("individual.import_individuals")
+    def import_individuals(
+        self,
+        import_file: InMemoryUploadedFile,
+        workflow: WorkflowHandler,
+        group_aggregation_column: str,
+    ):
         upload = self._save_sources(import_file)
-        self._create_individual_data_upload_records(workflow, upload, group_aggregation_column)
+        self._create_individual_data_upload_records(
+            workflow, upload, group_aggregation_column
+        )
         self._trigger_workflow(workflow, upload)
-        return {'success': True, 'data': {'upload_uuid': upload.uuid}}
+        return {"success": True, "data": {"upload_uuid": upload.uuid}}
 
     @transaction.atomic
     def _save_sources(self, import_file):
@@ -647,31 +767,38 @@ class IndividualImportService:
         return upload
 
     @transaction.atomic
-    def _create_individual_data_upload_records(self, workflow, upload, group_aggregation_column):
+    def _create_individual_data_upload_records(
+        self, workflow, upload, group_aggregation_column
+    ):
         record = IndividualDataUploadRecords(
             data_upload=upload,
             workflow=workflow.name if hasattr(workflow, "name") else str(workflow),
-            json_ext={"group_aggregation_column": group_aggregation_column}
+            json_ext={"group_aggregation_column": group_aggregation_column},
         )
         record.save(user=self.user)
 
     def validate_import_individuals(self, upload_id: uuid, individual_sources):
         dataframe = load_dataframe(individual_sources)
         validated_dataframe, invalid_items = self._validate_possible_individuals(
-            dataframe,
-            upload_id
+            dataframe, upload_id
         )
-        return {'success': True, 'data': validated_dataframe, 'summary_invalid_items': invalid_items}
+        return {
+            "success": True,
+            "data": validated_dataframe,
+            "summary_invalid_items": invalid_items,
+        }
 
     def synchronize_data_for_reporting(self, upload_id: uuid):
-        if 'opensearch_reports' in apps.app_configs:
+        if "opensearch_reports" in apps.app_configs:
             from individual.documents import IndividualDocument
 
-            individuals = Individual.objects.filter(individualdatasource__upload=upload_id)
+            individuals = Individual.objects.filter(
+                individualdatasource__upload=upload_id
+            )
             if not individuals:
                 return
 
-            IndividualDocument().update(individuals, 'index')
+            IndividualDocument().update(individuals, "index")
 
     @staticmethod
     def process_chunk(
@@ -683,22 +810,30 @@ class IndividualImportService:
         duplicate_village_name_code_tuples,
     ):
         validated_dataframe = []
-        check_location = 'location_name' in chunk.columns
+        check_location = "location_name" in chunk.columns
 
         for _, row in chunk.iterrows():
-            field_validation = {'row': row.to_dict(), 'validations': {}}
+            field_validation = {"row": row.to_dict(), "validations": {}}
             for field, field_properties in properties.items():
 
                 # Validation Calculation
                 if "validationCalculation" in field_properties and field in row:
-                    field_validation['validations'][field] = IndividualImportService._handle_validation_calculation(row, field, field_properties)
+                    field_validation["validations"][field] = (
+                        IndividualImportService._handle_validation_calculation(
+                            row, field, field_properties
+                        )
+                    )
 
                 # Uniqueness Check
                 if "uniqueness" in field_properties and field in row:
-                    field_validation['validations'][f'{field}_uniqueness'] = IndividualImportService._handle_uniqueness(row, field, unique_validations)
+                    field_validation["validations"][f"{field}_uniqueness"] = (
+                        IndividualImportService._handle_uniqueness(
+                            row, field, unique_validations
+                        )
+                    )
 
-            if 'location_name' in chunk.columns:
-                field_validation['validations']['location_name'] = (
+            if "location_name" in chunk.columns:
+                field_validation["validations"]["location_name"] = (
                     IndividualImportService._validate_location(
                         row.location_name,
                         row.location_code,
@@ -716,20 +851,26 @@ class IndividualImportService:
         schema_dict = json.loads(IndividualConfig.individual_schema)
         properties = schema_dict.get("properties", {})
 
-        unique_fields = [field for field, props in properties.items() if "uniqueness" in props]
+        unique_fields = [
+            field for field, props in properties.items() if "uniqueness" in props
+        ]
         unique_validations = {}
         if unique_fields:
             unique_validations = {
-                field: dataframe[field].duplicated(keep=False) 
+                field: dataframe[field].duplicated(keep=False)
                 for field in unique_fields
             }
 
-        check_location = 'location_name' in dataframe.columns
+        check_location = "location_name" in dataframe.columns
         if check_location:
             # Issue a single DB query instead of per row for efficiency
-            loc_name_code_district_ids_from_db = self._query_location_district_ids(dataframe)
+            loc_name_code_district_ids_from_db = self._query_location_district_ids(
+                dataframe
+            )
             user_allowed_loc_ids = LocationManager().get_allowed_ids(self.user)
-            duplicate_village_name_code_tuples = self._query_duplicate_village_name_code()
+            duplicate_village_name_code_tuples = (
+                self._query_duplicate_village_name_code()
+            )
         else:
             loc_name_code_district_ids_from_db = None
             user_allowed_loc_ids = None
@@ -751,106 +892,82 @@ class IndividualImportService:
 
     @staticmethod
     def _query_location_district_ids(df):
-        unique_tuples = df[['location_name', 'location_code']].drop_duplicates()
+        unique_tuples = df[["location_name", "location_code"]].drop_duplicates()
         query = Q()
         for _, row in unique_tuples.iterrows():
-            query |= Q(name=row['location_name'], code=row['location_code'])
+            query |= Q(name=row["location_name"], code=row["location_code"])
         locations = Location.objects.filter(type="V", *filter_validity()).filter(query)
         return {(loc.name, loc.code): loc.parent.parent.id for loc in locations}
 
     @staticmethod
     def _query_duplicate_village_name_code():
         return (
-            Location.objects
-            .filter(type="V", *filter_validity())
-            .values('name', 'code')
-            .annotate(name_count=Count('id'))
+            Location.objects.filter(type="V", *filter_validity())
+            .values("name", "code")
+            .annotate(name_count=Count("id"))
             .filter(name_count__gt=1)
-            .values_list('name', 'code')
+            .values_list("name", "code")
         )
 
-    # @staticmethod
-    # def _validate_location(
-    #     location_name,
-    #     location_code,
-    #     loc_name_code_district_ids_from_db,
-    #     user_allowed_loc_ids,
-    #     duplicate_village_name_code_tuples
-    # ):
-    #     result = {
-    #         'field_name': 'location_name',
-    #     }
-    #     if (pd.isna(location_name) or location_name == "") and (pd.isna(location_code) or location_code == ""):
-    #         result['success'] = True
-    #     elif loc_name_code_district_ids_from_db is None and user_allowed_loc_ids is None:
-    #         result['success'] = True
-    #     elif (location_name, location_code) not in loc_name_code_district_ids_from_db:
-    #         result['success'] = False
-    #         result['note'] = f"Location with name '{location_name}' and code '{location_code}' is not valid. Please check the spelling against the list of locations in the system."
-    #     elif (location_name, location_code) in duplicate_village_name_code_tuples:
-    #         result['success'] = False
-    #         result['note'] = f"Location with name '{location_name}' and code '{location_code}' is ambiguous, because there are more than one location with this name and code found in the system."
-    #     elif loc_name_code_district_ids_from_db[(location_name, location_code)] not in user_allowed_loc_ids:
-    #         result['success'] = False
-    #         result['note'] = f"Location with name '{location_name}' and code '{location_code}' is outside the current user's location permissions."
-    #     else:
-    #         result['success'] = True
-    #     return result
-    
     @staticmethod
     def _validate_location(
         location_name,
         location_code,
         loc_name_code_district_ids_from_db,
         user_allowed_loc_ids,
-        duplicate_village_name_code_tuples
+        duplicate_village_name_code_tuples,
     ):
         """
         Validate location by ALWAYS normalizing the code to 9 digits.
         This ensures compatibility with openIMIS DB codes and fixes UI display issues.
         """
-        result = {'field_name': 'location_name'}
+        result = {"field_name": "location_name"}
 
-        # --- NORMALIZE THE CODE (CRITICAL FIX) ---
-        code = '' if pd.isna(location_code) else str(location_code).strip()
-        code = code.replace('.0', '')                        # remove Excel float
-        code = ''.join(ch for ch in code if ch.isdigit())    # digits only
+        # --- NORMALIZE THE CODE ---
+        code = "" if pd.isna(location_code) else str(location_code).strip()
+        code = code.replace(".0", "")  # remove Excel float
+        code = "".join(ch for ch in code if ch.isdigit())  # digits only
 
         if code:
-            code = code.zfill(9)                             # ALWAYS 9 digits for TASAF
+            code = code.zfill(9)  # ALWAYS 9 digits for TASAF
 
         # ---------------- VALIDATION -----------------
         if (pd.isna(location_name) or str(location_name).strip() == "") and code == "":
-            result['success'] = True
+            result["success"] = True
 
-        elif loc_name_code_district_ids_from_db is None and user_allowed_loc_ids is None:
-            result['success'] = True
+        elif (
+            loc_name_code_district_ids_from_db is None and user_allowed_loc_ids is None
+        ):
+            result["success"] = True
 
         elif (location_name, code) not in loc_name_code_district_ids_from_db:
-            result['success'] = False
-            result['note'] = (
+            result["success"] = False
+            result["note"] = (
                 f"Location with name '{location_name}' and code '{code}' is not valid. "
                 "Please check the spelling against the list of locations in the system."
             )
 
         elif (location_name, code) in duplicate_village_name_code_tuples:
-            result['success'] = False
-            result['note'] = (
+            result["success"] = False
+            result["note"] = (
                 f"Location with name '{location_name}' and code '{code}' is ambiguous, "
                 "because more than one matching location exists."
             )
 
-        elif loc_name_code_district_ids_from_db[(location_name, code)] not in user_allowed_loc_ids:
-            result['success'] = False
-            result['note'] = (
+        elif (
+            loc_name_code_district_ids_from_db[(location_name, code)]
+            not in user_allowed_loc_ids
+        ):
+            result["success"] = False
+            result["note"] = (
                 f"Location with name '{location_name}' and code '{code}' is outside the current user's location permissions."
             )
 
         else:
-            result['success'] = True
+            result["success"] = True
 
         return result
-    
+
     @staticmethod
     def _normalize_code_series(series: pd.Series, width: int) -> pd.Series:
         """
@@ -861,13 +978,11 @@ class IndividualImportService:
         - pad left to fixed width
         """
         s = series.astype(str).str.strip()
-        s = s.str.replace(r'\.0$', '', regex=True)
-        s = s.str.replace(r'[^0-9]', '', regex=True)
+        s = s.str.replace(r"\.0$", "", regex=True)
+        s = s.str.replace(r"[^0-9]", "", regex=True)
         mask = s.str.len() > 0
         s.loc[mask] = s.loc[mask].str.zfill(width)
         return s
-
-
 
     @staticmethod
     def _handle_uniqueness(row, field, unique_validations):
@@ -882,7 +997,9 @@ class IndividualImportService:
 
     @staticmethod
     def _handle_validation_calculation(row, field, field_properties):
-        validation_calculation = field_properties.get("validationCalculation", {}).get("name")
+        validation_calculation = field_properties.get("validationCalculation", {}).get(
+            "name"
+        )
         if not validation_calculation:
             raise ValueError("Missing validation name")
         calculation_uuid = IndividualConfig.validation_calculation_uuid
@@ -896,7 +1013,9 @@ class IndividualImportService:
         return result_row
 
     def _create_upload_entry(self, filename):
-        upload = IndividualDataSourceUpload(source_name=filename, source_type='individual import')
+        upload = IndividualDataSourceUpload(
+            source_name=filename, source_type="individual import"
+        )
         upload.save(username=self.user.login_name)
         return upload
 
@@ -917,19 +1036,19 @@ class IndividualImportService:
         # Load using registered loader
         df = self.import_loaders[import_file.content_type](import_file)
 
-        # --- CRITICAL: Normalize codes for proper UI + validation behaviour ---
+        # --- Normalize codes for proper UI + validation behaviour ---
         # These columns may appear depending on the import template
-        if 'location_code' in df.columns:
-            df['location_code'] = self._normalize_code_series(df['location_code'], 9)
+        if "location_code" in df.columns:
+            df["location_code"] = self._normalize_code_series(df["location_code"], 9)
 
-        if 'ward_code' in df.columns:
-            df['ward_code'] = self._normalize_code_series(df['ward_code'], 6)
+        if "ward_code" in df.columns:
+            df["ward_code"] = self._normalize_code_series(df["ward_code"], 6)
 
-        if 'district_code' in df.columns:
-            df['district_code'] = self._normalize_code_series(df['district_code'], 4)
+        if "district_code" in df.columns:
+            df["district_code"] = self._normalize_code_series(df["district_code"], 4)
 
-        if 'region_code' in df.columns:
-            df['region_code'] = self._normalize_code_series(df['region_code'], 2)
+        if "region_code" in df.columns:
+            df["region_code"] = self._normalize_code_series(df["region_code"], 2)
 
         return df
 
@@ -938,7 +1057,9 @@ class IndividualImportService:
     #         raise ValueError("Unsupported content type: {}".format(import_file.content_type))
     #     return self.import_loaders[import_file.content_type](import_file)
 
-    def _save_data_source(self, dataframe: pd.DataFrame, upload: IndividualDataSourceUpload):
+    def _save_data_source(
+        self, dataframe: pd.DataFrame, upload: IndividualDataSourceUpload
+    ):
         data_source_objects = []
         for _, row in dataframe.iterrows():
             ds = IndividualDataSource(
@@ -947,27 +1068,27 @@ class IndividualImportService:
                 validations={},
                 user_created=self.user,
                 user_updated=self.user,
-                uuid=uuid.uuid4()
+                uuid=uuid.uuid4(),
             )
             data_source_objects.append(ds)
         IndividualDataSource.objects.bulk_create(data_source_objects)
 
-    def _trigger_workflow(self,
-                          workflow: WorkflowHandler,
-                          upload: IndividualDataSourceUpload):
+    def _trigger_workflow(
+        self, workflow: WorkflowHandler, upload: IndividualDataSourceUpload
+    ):
         """
         Trigger the configured workflow for this upload, with proper status transitions
         and error capture (matches original behavior). Also supports dotted-path/callables.
         """
-        #if no workflow 
+        # if no workflow
         if workflow is None:
             raise ValueError("No workflow provided for import_individuals")
-            
+
         try:
             # Before the run in order to avoid racing conditions
             upload.status = IndividualDataSourceUpload.Status.TRIGGERED
             upload.save(username=self.user.login_name)
-            
+
             # Resolve to an object exposing .run(ctx)
             runner = _resolve_workflow_runner(workflow, user=self.user)
 
@@ -975,23 +1096,29 @@ class IndividualImportService:
             core_user = User.objects.get(username=self.user.login_name)
             user_uuid = str(getattr(core_user, "id"))
 
-            result = runner.run({
-                'user_uuid': user_uuid,
-                'upload_uuid': str(upload.uuid),
-            })
+            result = runner.run(
+                {
+                    "user_uuid": user_uuid,
+                    "upload_uuid": str(upload.uuid),
+                }
+            )
 
             # Structured failure from handler -> mark FAIL and record error
-            if result and isinstance(result, dict) and result.get('success') is False:
-                raise ValueError(result.get('message', 'Unexpected error during the workflow execution'))
+            if result and isinstance(result, dict) and result.get("success") is False:
+                raise ValueError(
+                    result.get(
+                        "message", "Unexpected error during the workflow execution"
+                    )
+                )
 
         except ValueError as e:
             upload.status = IndividualDataSourceUpload.Status.FAIL
-            upload.error = {'workflow': str(e)}
+            upload.error = {"workflow": str(e)}
             upload.save(username=self.user.login_name)
             return upload
         except Exception as e:
             upload.status = IndividualDataSourceUpload.Status.FAIL
-            upload.error = {'workflow': str(e)}
+            upload.error = {"workflow": str(e)}
             upload.save(username=self.user.login_name)
             logger.exception("Workflow crashed for upload %s", upload.uuid)
             return upload
@@ -1006,34 +1133,50 @@ class IndividualImportService:
         - Refreshes group.json_ext members/head/recipients
         """
         from individual.models import (
-            Individual, Group, GroupIndividual,
-            IndividualDataUploadRecords, IndividualDataSourceUpload
+            Individual,
+            Group,
+            GroupIndividual,
+            IndividualDataUploadRecords,
+            IndividualDataSourceUpload,
         )
         from individual.services import (
-            GroupIndividualService, GroupAndGroupIndividualAlignmentService
+            GroupIndividualService,
+            GroupAndGroupIndividualAlignmentService,
         )
 
-        upload = IndividualDataSourceUpload.objects.filter(uuid=upload_uuid, is_deleted=False).first()
+        upload = IndividualDataSourceUpload.objects.filter(
+            uuid=upload_uuid, is_deleted=False
+        ).first()
         if not upload:
             return {"success": False, "message": f"Upload {upload_uuid} not found"}
 
         # Determine grouping column (defaults to 'group_code')
         group_col = "group_code"
-        rec = (IndividualDataUploadRecords.objects
-               .filter(data_upload=upload, is_deleted=False)
-               .order_by("id").first())
+        rec = (
+            IndividualDataUploadRecords.objects.filter(
+                data_upload=upload, is_deleted=False
+            )
+            .order_by("id")
+            .first()
+        )
         if rec and isinstance(rec.json_ext, dict):
             c = (rec.json_ext or {}).get("group_aggregation_column")
             if isinstance(c, str) and c.strip():
                 group_col = c.strip()
 
-        inds = (Individual.objects
-                .filter(individualdatasource__upload=upload, is_deleted=False)
-                .distinct())
+        inds = Individual.objects.filter(
+            individualdatasource__upload=upload, is_deleted=False
+        ).distinct()
 
         if not inds.exists():
-            return {"success": True, "group_column": group_col, "created_groups": 0,
-                    "created_links": 0, "updated_links": 0, "groups_touched": 0}
+            return {
+                "success": True,
+                "group_column": group_col,
+                "created_groups": 0,
+                "created_links": 0,
+                "updated_links": 0,
+                "groups_touched": 0,
+            }
 
         aligner = GroupAndGroupIndividualAlignmentService(self.user)
 
@@ -1061,32 +1204,47 @@ class IndividualImportService:
 
                 # Role / recipient inference from individual's json_ext
                 jx = ind.json_ext or {}
-                role_code = str(jx.get("individual_role_code") or jx.get("relationship_to_head") or "").strip()
+                role_code = str(
+                    jx.get("individual_role_code")
+                    or jx.get("relationship_to_head")
+                    or ""
+                ).strip()
                 hhrep_code = str(jx.get("hhrep") or "").strip()
 
                 desired_role = GroupIndividual.Role.HEAD if role_code == "1" else None
-                desired_recipient = (GroupIndividual.RecipientType.PRIMARY
-                                     if (hhrep_code and hhrep_code == role_code) else None)
+                desired_recipient = (
+                    GroupIndividual.RecipientType.PRIMARY
+                    if (hhrep_code and hhrep_code == role_code)
+                    else None
+                )
 
                 # Align locations BEFORE linking (mirrors your earlier logic)
                 has_head = GroupIndividual.objects.filter(
                     group=grp, role=GroupIndividual.Role.HEAD, is_deleted=False
                 ).exists()
-                role_for_alignment = desired_role if (desired_role == GroupIndividual.Role.HEAD or not has_head) else None
+                role_for_alignment = (
+                    desired_role
+                    if (desired_role == GroupIndividual.Role.HEAD or not has_head)
+                    else None
+                )
                 try:
                     aligner.ensure_location_consistent(grp, ind, role_for_alignment)
                 except Exception:
                     # non-fatal alignment error
                     pass
 
-                gi = GroupIndividual.objects.filter(group=grp, individual=ind, is_deleted=False).first()
+                gi = GroupIndividual.objects.filter(
+                    group=grp, individual=ind, is_deleted=False
+                ).first()
                 if not gi:
-                    GroupIndividualService(self.user).create({
-                        "group_id": str(grp.id),
-                        "individual_id": str(ind.id),
-                        "role": desired_role,
-                        "recipient_type": desired_recipient,
-                    })
+                    GroupIndividualService(self.user).create(
+                        {
+                            "group_id": str(grp.id),
+                            "individual_id": str(ind.id),
+                            "role": desired_role,
+                            "recipient_type": desired_recipient,
+                        }
+                    )
                     created_links += 1
                 else:
                     changed = False
@@ -1109,10 +1267,16 @@ class IndividualImportService:
                             upd = False
                             if grp.json_ext is None:
                                 grp.json_ext = {}
-                            if pmt_score is not None and grp.json_ext.get("pmt_score_household") != pmt_score:
+                            if (
+                                pmt_score is not None
+                                and grp.json_ext.get("pmt_score_household") != pmt_score
+                            ):
                                 grp.json_ext["pmt_score_household"] = pmt_score
                                 upd = True
-                            if pmt_class is not None and grp.json_ext.get("pmt_class_household") != pmt_class:
+                            if (
+                                pmt_class is not None
+                                and grp.json_ext.get("pmt_class_household") != pmt_class
+                            ):
                                 grp.json_ext["pmt_class_household"] = pmt_class
                                 upd = True
                             if upd:
@@ -1140,7 +1304,10 @@ class IndividualImportService:
     def link_groups_for_upload_id(self, upload_id) -> dict:
         """Helper: accept DB PK and forward to UUID-based method."""
         from individual.models import IndividualDataSourceUpload
-        up = IndividualDataSourceUpload.objects.filter(id=upload_id, is_deleted=False).first()
+
+        up = IndividualDataSourceUpload.objects.filter(
+            id=upload_id, is_deleted=False
+        ).first()
         if not up:
             return {"success": False, "message": f"Upload id {upload_id} not found"}
         return self.link_groups_for_upload_uuid(str(up.uuid))
@@ -1153,59 +1320,68 @@ class IndividualImportService:
         data_sources_to_update = []
 
         for field_validation in validated_dataframe:
-            row = field_validation['row']
+            row = field_validation["row"]
             error_fields = []
 
-            for key, value in field_validation['validations'].items():
-                if not value.get('success', False):
-                    error_fields.append({
-                        "field_name": value.get('field_name'),
-                        "note": value.get('note')
-                    })
+            for key, value in field_validation["validations"].items():
+                if not value.get("success", False):
+                    error_fields.append(
+                        {
+                            "field_name": value.get("field_name"),
+                            "note": value.get("note"),
+                        }
+                    )
 
             data_sources_to_update.append(
                 IndividualDataSource(
-                    id=row['id'],
-                    validations={'validation_errors': error_fields}
+                    id=row["id"], validations={"validation_errors": error_fields}
                 )
             )
 
         if data_sources_to_update:
-            IndividualDataSource.objects.bulk_update(data_sources_to_update, ['validations'])
+            IndividualDataSource.objects.bulk_update(
+                data_sources_to_update, ["validations"]
+            )
 
     def create_task_with_importing_valid_items(self, upload_id: uuid):
         if IndividualConfig.enable_maker_checker_for_individual_upload:
-            IndividualTaskCreatorService(self.user) \
-                .create_task_with_importing_valid_items(upload_id)
+            IndividualTaskCreatorService(
+                self.user
+            ).create_task_with_importing_valid_items(upload_id)
         else:
             record = IndividualDataUploadRecords.objects.get(
-                data_upload_id=upload_id,
-                is_deleted=False
+                data_upload_id=upload_id, is_deleted=False
             )
-            from individual.signals.on_validation_import_valid_items import IndividualItemsImportTaskCompletionEvent
+            from individual.signals.on_validation_import_valid_items import (
+                IndividualItemsImportTaskCompletionEvent,
+            )
+
             IndividualItemsImportTaskCompletionEvent(
                 IndividualConfig.validation_import_valid_items_workflow,
                 record,
                 record.data_upload.id,
-                self.user
+                self.user,
             ).run_workflow()
 
     def create_task_with_update_valid_items(self, upload_id: uuid):
         # Resolve automatically if maker-checker not enabled
         if IndividualConfig.enable_maker_checker_for_individual_update:
-            IndividualTaskCreatorService(self.user) \
-                .create_task_with_update_valid_items(upload_id)
+            IndividualTaskCreatorService(self.user).create_task_with_update_valid_items(
+                upload_id
+            )
         else:
             record = IndividualDataUploadRecords.objects.get(
-                data_upload_id=upload_id,
-                is_deleted=False
+                data_upload_id=upload_id, is_deleted=False
             )
-            from individual.signals.on_validation_import_valid_items import IndividualItemsUploadTaskCompletionEvent
+            from individual.signals.on_validation_import_valid_items import (
+                IndividualItemsUploadTaskCompletionEvent,
+            )
+
             IndividualItemsUploadTaskCompletionEvent(
                 IndividualConfig.validation_upload_valid_items_workflow,
                 record,
                 record.data_upload.id,
-                self.user
+                self.user,
             ).run_workflow()
 
 
@@ -1220,34 +1396,39 @@ class IndividualTaskCreatorService:
     def create_task_with_update_valid_items(self, upload_id: uuid):
         self._create_task(upload_id, IndividualConfig.validation_upload_valid_items)
 
-    @register_service_signal('individual.update_task')
+    @register_service_signal("individual.update_task")
     @transaction.atomic()
     def _create_task(self, upload_id, business_event):
         from tasks_management.services import TaskService
         from tasks_management.apps import TasksManagementConfig
         from tasks_management.models import Task
+
         upload_record = IndividualDataUploadRecords.objects.get(
-            data_upload_id=upload_id,
-            is_deleted=False
+            data_upload_id=upload_id, is_deleted=False
         )
         json_ext = {
-            'source_name': upload_record.data_upload.source_name,
-            'workflow': upload_record.workflow,
-            'percentage_of_invalid_items': self.__calculate_percentage_of_invalid_items(upload_id),
-            'data_upload_id': str(upload_id),
-            'group_aggregation_column':
-                upload_record.json_ext.get('group_aggregation_column')
+            "source_name": upload_record.data_upload.source_name,
+            "workflow": upload_record.workflow,
+            "percentage_of_invalid_items": self.__calculate_percentage_of_invalid_items(
+                upload_id
+            ),
+            "data_upload_id": str(upload_id),
+            "group_aggregation_column": (
+                upload_record.json_ext.get("group_aggregation_column")
                 if isinstance(upload_record.json_ext, dict)
-                else None,
+                else None
+            ),
         }
-        TaskService(self.user).create({
-            'source': 'import_valid_items',
-            'entity': upload_record,
-            'status': Task.Status.RECEIVED,
-            'executor_action_event': TasksManagementConfig.default_executor_event,
-            'business_event': business_event,
-            'json_ext': json_ext
-        })
+        TaskService(self.user).create(
+            {
+                "source": "import_valid_items",
+                "entity": upload_record,
+                "status": Task.Status.RECEIVED,
+                "executor_action_event": TasksManagementConfig.default_executor_event,
+                "business_event": business_event,
+                "json_ext": json_ext,
+            }
+        )
 
         data_upload = upload_record.data_upload
         data_upload.status = IndividualDataSourceUpload.Status.WAITING_FOR_VERIFICATION
