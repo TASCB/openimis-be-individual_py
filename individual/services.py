@@ -1060,17 +1060,64 @@ class IndividualImportService:
     def _save_data_source(
         self, dataframe: pd.DataFrame, upload: IndividualDataSourceUpload
     ):
+        """
+        Save each uploaded row as IndividualDataSource.json_ext.
+
+        Key fix:
+        - If the incoming dataframe has a 'json_ext' column, it often contains a JSON STRING
+        (because ETL writes json_ext as serialized JSON in the CSV).
+        - If we store it as-is, we end up with:
+            {"json_ext": "{...string...}", ...}
+        which later propagates to Individual.Json_ext and causes json_ext->'json_ext' to be a string.
+        - Here we parse that string into a dict and merge it into the row payload.
+        """
         data_source_objects = []
+
         for _, row in dataframe.iterrows():
+            # Convert row to a plain python dict (safe for JSON dumps/loads)
+            row_dict = json.loads(row.to_json())
+
+            # ---- FIX: parse json_ext string -> dict and inline it properly ----
+            jx = row_dict.get("json_ext")
+
+            if isinstance(jx, str):
+                # Sometimes pandas stores NaN-like values as "nan" string
+                jx_str = jx.strip()
+                if jx_str and jx_str.lower() not in ("nan", "none", "null"):
+                    try:
+                        parsed = json.loads(jx_str)
+                        if isinstance(parsed, dict):
+                            row_dict["json_ext"] = parsed
+                        else:
+                            # If it's valid JSON but not an object, keep as empty object
+                            row_dict["json_ext"] = {}
+                    except Exception:
+                        # If parsing fails, keep an empty object rather than a broken string
+                        row_dict["json_ext"] = {}
+                else:
+                    row_dict["json_ext"] = {}
+
+            elif jx is None:
+                row_dict["json_ext"] = {}
+
+            # If already dict, keep it as-is
+            if not isinstance(row_dict.get("json_ext"), dict):
+                row_dict["json_ext"] = {}
+
+            # ---- OPTIONAL: ensure 'raw' is preserved if present (no overwrite) ----
+            # (Do nothing special here; we store whatever is inside row_dict["json_ext"].
+            # Your ETL already puts questionnaire variables in json_ext["raw"].)
+
             ds = IndividualDataSource(
                 upload=upload,
-                json_ext=json.loads(row.to_json()),
+                json_ext=row_dict,
                 validations={},
                 user_created=self.user,
                 user_updated=self.user,
                 uuid=uuid.uuid4(),
             )
             data_source_objects.append(ds)
+
         IndividualDataSource.objects.bulk_create(data_source_objects)
 
     def _trigger_workflow(
