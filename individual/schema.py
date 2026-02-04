@@ -1,6 +1,7 @@
 import json
 import graphene
 import graphene_django_optimizer as gql_optimizer
+import django_filters
 import pandas as pd
 
 from django.contrib.auth.models import AnonymousUser
@@ -202,32 +203,33 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         group_id = kwargs.get("groupId")
         if group_id:
             filters.append(Q(groupindividuals__group__id=group_id))
-        # NEW: Filter for non-consented household stubs
-        is_non_consented = kwargs.get("isNonConsented")
-        if is_non_consented:
-            filters.append(
-                Q(json_ext__raw__record_type="household_stub")
-                & Q(json_ext__raw__consent_res__in=["2", 2])
-            )
-        benefit_plan_to_enroll = kwargs.get("benefitPlanToEnroll")
-        if benefit_plan_to_enroll:
-            filters.append(
-                Q(is_deleted=False)
-                & ~Q(beneficiary__benefit_plan_id=benefit_plan_to_enroll)
-            )
-        benefit_plan_to_enroll = kwargs.get("benefitPlanToEnroll")
-        if benefit_plan_to_enroll:
-            filters.append(
-                Q(is_deleted=False)
-                & ~Q(beneficiary__benefit_plan_id=benefit_plan_to_enroll)
-            )
 
+        # ---- Consent filtering (default: EXCLUDE non-consented stubs) ----
+        is_non_consented = kwargs.get("isNonConsented", None)
+
+        non_consented_q = (
+            Q(json_ext__json_ext__consent_res=2)
+            | Q(json_ext__json_ext__consent_res="2")
+        )
+
+        if is_non_consented is True:
+            # show only non-consented
+            filters.append(non_consented_q)
+        else:
+            # default (and also when explicitly false): hide non-consented
+            filters.append(~non_consented_q)
+
+        benefit_plan_to_enroll = kwargs.get("benefitPlanToEnroll")
+        if benefit_plan_to_enroll:
+            filters.append(
+                Q(is_deleted=False)
+                & ~Q(beneficiary__benefit_plan_id=benefit_plan_to_enroll)
+            )
         benefit_plan_id = kwargs.get("benefitPlanId")
         if benefit_plan_id:
             filters.append(
                 Q(is_deleted=False) & Q(beneficiary__benefit_plan_id=benefit_plan_id)
             )
-
         filter_not_attached_to_group = kwargs.get("filterNotAttachedToGroup")
         if filter_not_attached_to_group:
             subquery = (
@@ -574,3 +576,36 @@ class Mutation(graphene.ObjectType):
 
     confirm_individual_enrollment = ConfirmIndividualEnrollmentMutation.Field()
     confirm_group_enrollment = ConfirmGroupEnrollmentMutation.Field()
+
+class IndividualFilterSet(django_filters.FilterSet):
+    """
+    Filters Individuals by consent flag stored in Individual.Json_ext.
+
+    IMPORTANT:
+    Your DB query shows the real path is:
+      Json_ext -> 'json_ext' ->> 'consent_res'
+    So the Django ORM JSONField path must be:
+      json_ext__json_ext__consent_res
+    """
+
+    is_non_consented = django_filters.BooleanFilter(method="filter_is_non_consented")
+
+    def filter_is_non_consented(self, queryset, name, value):
+        if value is None:
+            return queryset
+
+        non_consented_q = (
+            Q(json_ext__json_ext__consent_res=2)
+            | Q(json_ext__json_ext__consent_res="2")
+        )
+
+        if value is True:
+            # only non-consented
+            return queryset.filter(non_consented_q)
+
+        # explicitly false -> only consented (anything NOT 2)
+        return queryset.exclude(non_consented_q)
+
+    class Meta:
+        model = Individual
+        fields = []

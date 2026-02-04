@@ -1,4 +1,6 @@
 import graphene
+import django_filters
+from django.db.models import Q
 from django.contrib.auth.models import AnonymousUser
 from graphene_django import DjangoObjectType
 import graphene_django_optimizer as gql_optimizer
@@ -25,8 +27,52 @@ class JsonExtMixin:
         return None
 
 
+class IndividualFilterSet(django_filters.FilterSet):
+    """
+    Adds GraphQL filter: isNonConsented (camelCase) ✅
+
+    IMPORTANT:
+    - This is ETL-safe: no DB migration required.
+    - It relies on json_ext markers. We support several common keys so older/newer payloads still work.
+    - Best practice going forward: ETL should set json_ext["is_non_consented"] = true
+      (or json_ext["raw"]["is_non_consented"] = true) so this filter always works.
+    """
+
+    is_non_consented = django_filters.BooleanFilter(method="filter_is_non_consented")
+
+    def filter_is_non_consented(self, queryset, name, value):
+        if value is None:
+            return queryset
+
+        # Supported marker patterns (top-level + raw)
+        marker_q = (
+            # Preferred explicit marker (future-proof if ETL sets it later)
+            Q(json_ext__contains={"is_non_consented": True})
+            | Q(json_ext__contains={"isNonConsented": True})
+
+            # ✅ Your real storage: json_ext.json_ext.consent_res
+            | Q(json_ext__json_ext__consent_res=2)
+            | Q(json_ext__json_ext__consent_res="2")
+        )
+
+
+
+        if value is True:
+            return queryset.filter(marker_q)
+
+        # value is False => exclude those marked as non-consented
+        return queryset.exclude(marker_q)
+
+    class Meta:
+        model = Individual
+        fields = []
+
 class IndividualGQLType(DjangoObjectType):
-    uuid = graphene.String(source='uuid')
+    uuid = graphene.String(source="uuid")
+
+    # GraphQL camelCase fields
+    tf4_no = graphene.String(name="tf4No")
+    interview_key = graphene.String(name="interviewKey")  # you want to show external_id
 
     class Meta:
         model = Individual
@@ -48,6 +94,48 @@ class IndividualGQLType(DjangoObjectType):
     def get_queryset(cls, queryset, info):
         return Individual.get_queryset(queryset, info.context.user)
 
+    def resolve_tf4_no(self, info):
+        # NOTE: here "self" is the Django model instance (Individual)
+        if not _have_permissions(info.context.user, IndividualConfig.gql_individual_search_perms):
+            return None
+
+        ext = getattr(self, "json_ext", None) or {}
+        nested = ext.get("json_ext") or {}
+        raw = nested.get("raw") or {}
+
+        v = raw.get("TF4_NO") or raw.get("tf4_no")
+        return str(v) if v is not None else None
+
+    def resolve_interview_key(self, info):
+        """
+        You said: external_id = interview_key (configured in module config)
+        So UI "interviewKey" should show external_id (e.g. 33-16-67-10)
+        """
+        if not _have_permissions(info.context.user, IndividualConfig.gql_individual_search_perms):
+            return None
+
+        ext = getattr(self, "json_ext", None) or {}
+        nested = ext.get("json_ext") or {}
+        raw = nested.get("raw") or {}
+
+        v = (
+            ext.get("external_id")
+            or ext.get("interview_key")
+            or ext.get("interviewKey")
+            or nested.get("external_id")
+            or nested.get("interview_key")
+            or nested.get("interviewKey")
+            or raw.get("external_id")
+            or raw.get("interview_key")
+            or raw.get("interviewKey")
+        )
+
+        return str(v) if v is not None else None
+
+
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return Individual.get_queryset(queryset, info.context.user)
 
 class IndividualHistoryGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
