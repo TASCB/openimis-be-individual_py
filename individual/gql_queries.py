@@ -29,7 +29,7 @@ class JsonExtMixin:
 
 class IndividualFilterSet(django_filters.FilterSet):
     """
-    Adds GraphQL filter: isNonConsented (camelCase) ✅
+    Adds GraphQL filter: isNonConsented (camelCase) 
 
     IMPORTANT:
     - This is ETL-safe: no DB migration required.
@@ -50,7 +50,7 @@ class IndividualFilterSet(django_filters.FilterSet):
             Q(json_ext__contains={"is_non_consented": True})
             | Q(json_ext__contains={"isNonConsented": True})
 
-            # ✅ Your real storage: json_ext.json_ext.consent_res
+            # real storage: json_ext.json_ext.consent_res
             | Q(json_ext__json_ext__consent_res=2)
             | Q(json_ext__json_ext__consent_res="2")
         )
@@ -70,9 +70,9 @@ class IndividualFilterSet(django_filters.FilterSet):
 class IndividualGQLType(DjangoObjectType):
     uuid = graphene.String(source="uuid")
 
-    # GraphQL camelCase fields
+    # GraphQL camelCase fields for UI
     tf4_no = graphene.String(name="tf4No")
-    interview_key = graphene.String(name="interviewKey")  # you want to show external_id
+    interview_key = graphene.String(name="interviewKey")
 
     class Meta:
         model = Individual
