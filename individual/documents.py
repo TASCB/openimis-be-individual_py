@@ -58,16 +58,33 @@ if "opensearch_reports" in apps.app_configs:
 
         # Only index these json_ext keys (adapter keeps everything else in json_ext["raw"])
         INDEXED_JSON_KEYS = [
+            # Identity / linking
             "external_id",
+            "interview_key",
+
+            # Household grouping
             "group_code",
             "individual_role",
             "individual_role_code",
             "hhrep",
+
+            # Program / targeting
+            "pssn_wave",
+            "consent",          # or "consent_res" depending on what you store
             "pmt_score",
             "pmt_class",
+
+            # Time / batch
+            "interview_date",
             "ss_batch",
-            # add more small top-level keys here
+
+            # Geography (for dashboards)
+            "region_code",
+            "district_code",
+            "ward_code",
+            "village_code",
         ]
+
 
         def prepare_json_ext(self, instance):
             jx = instance.json_ext or {}
