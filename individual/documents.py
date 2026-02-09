@@ -41,7 +41,7 @@ if 'opensearch_reports' in apps.app_configs:
             fields = [
                 'id'
             ]
-            queryset_pagination = 5000
+            queryset_pagination = 1000
 
         def prepare_json_ext(self, instance):
             json_ext_data = instance.json_ext
@@ -74,7 +74,7 @@ if 'opensearch_reports' in apps.app_configs:
             'dob': opensearch_fields.DateField(),
         })
         role = opensearch_fields.KeywordField()
-        recipient_type = opensearch_fields.KeywordField(),
+        recipient_type = opensearch_fields.KeywordField()
         json_ext = opensearch_fields.ObjectField()
 
         class Index:
