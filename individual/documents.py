@@ -53,10 +53,9 @@ if "opensearch_reports" in apps.app_configs:
             fields = [
                 "id",
             ]
-            # Keep batches reasonable to avoid huge bulk payloads
             queryset_pagination = 1000
 
-        # Only index these json_ext keys (adapter keeps everything else in json_ext["raw"])
+    
         INDEXED_JSON_KEYS = [
             # Identity / linking
             "external_id",
@@ -70,7 +69,7 @@ if "opensearch_reports" in apps.app_configs:
 
             # Program / targeting
             "pssn_wave",
-            "consent",          # or "consent_res" depending on what you store
+            "consent_res",
             "pmt_score",
             "pmt_class",
 
@@ -94,8 +93,6 @@ if "opensearch_reports" in apps.app_configs:
             # Never index raw payload; adapter already stores survey variables under json_ext["raw"]
             out = {k: jx.get(k) for k in self.INDEXED_JSON_KEYS}
 
-            # Optional: If you set location_str in services.py, you may want it searchable too.
-            # It is stored in json_ext by your IndividualService._update_json_ext().
             if "location_str" in jx:
                 out["location_str"] = jx.get("location_str")
 
