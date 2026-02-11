@@ -1,12 +1,10 @@
-# individual/documents.py
-
 from django.apps import apps
 from django.conf import settings
 
-is_unit_test_env = getattr(settings, "IS_UNIT_TEST_ENV", False)
+is_unit_test_env = getattr(settings, 'IS_UNIT_TEST_ENV', False)
 
-# Only register OpenSearch documents if opensearch_reports is installed
-if "opensearch_reports" in apps.app_configs:
+# Check if the 'opensearch_reports' app is in INSTALLED_APPS
+if 'opensearch_reports' in apps.app_configs:
     from opensearch_reports.service import BaseSyncDocument
     from django_opensearch_dsl import fields as opensearch_fields
     from django_opensearch_dsl.registries import registry
@@ -14,120 +12,75 @@ if "opensearch_reports" in apps.app_configs:
         Individual,
         IndividualDataSourceUpload,
         GroupIndividual,
-        Group,
+        Group
     )
 
-    # Skip auto-refresh on model update when running unit tests to avoid connection issues
+    # skip indexing on model update when running unit tests to avoid connection issues
     auto_refresh = not is_unit_test_env
 
     @registry.register_document
     class IndividualDocument(BaseSyncDocument):
-        """
-        Index for Individuals.
+        DASHBOARD_NAME = 'Individual'
 
-        Important:
-        - Do NOT flatten json_ext, because adapter stores full survey payload in json_ext["raw"].
-        - Index only a small, predictable subset of json_ext keys used for search/filters/dashboards.
-        """
-        DASHBOARD_NAME = "Individual"
-
-        # Top-level searchable fields (fast filters / exact matches)
         first_name = opensearch_fields.KeywordField()
         last_name = opensearch_fields.KeywordField()
         dob = opensearch_fields.DateField()
         date_created = opensearch_fields.DateField()
-
-        # json_ext indexed as an object (but we will only populate whitelisted keys)
         json_ext = opensearch_fields.ObjectField()
 
         class Index:
-            name = "individual"
+            name = 'individual'
             settings = {
-                "number_of_shards": 1,
-                "number_of_replicas": 0,
+                'number_of_shards': 1,
+                'number_of_replicas': 0
             }
             auto_refresh = auto_refresh
 
         class Django:
             model = Individual
             fields = [
-                "id",
+                'id'
             ]
-            queryset_pagination = 1000
-
-    
-        INDEXED_JSON_KEYS = [
-            # Identity / linking
-            "external_id",
-            "interview_key",
-
-            # Household grouping
-            "group_code",
-            "individual_role",
-            "individual_role_code",
-            "hhrep",
-
-            # Program / targeting
-            "pssn_wave",
-            "consent_res",
-            "pmt_score",
-            "pmt_class",
-
-            # Time / batch
-            "interview_date",
-            "ss_batch",
-
-            # Geography (for dashboards)
-            "region_code",
-            "district_code",
-            "ward_code",
-            "village_code",
-        ]
-
+            queryset_pagination = 5000
 
         def prepare_json_ext(self, instance):
-            jx = instance.json_ext or {}
-            if not isinstance(jx, dict):
-                return {}
+            json_ext_data = instance.json_ext
+            json_data = self.__flatten_dict(json_ext_data)
+            return json_data
 
-            # Never index raw payload; adapter already stores survey variables under json_ext["raw"]
-            out = {k: jx.get(k) for k in self.INDEXED_JSON_KEYS}
-
-            if "location_str" in jx:
-                out["location_str"] = jx.get("location_str")
-
-            return out
+        def __flatten_dict(self, d, parent_key='', sep='__'):
+            items = {}
+            for k, v in d.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                if isinstance(v, dict):
+                    items.update(self.__flatten_dict(v, new_key, sep=sep))
+                else:
+                    items[new_key] = v
+            return items
 
     @registry.register_document
     class GroupIndividualDocument(BaseSyncDocument):
-        """
-        Index for GroupIndividual relations.
-        """
-        DASHBOARD_NAME = "Group"
+        DASHBOARD_NAME = 'Group'
 
-        group = opensearch_fields.ObjectField(
-            properties={
-                "id": opensearch_fields.KeywordField(),
-                "code": opensearch_fields.KeywordField(),
-                "json_ext": opensearch_fields.ObjectField(),
-            }
-        )
-        individual = opensearch_fields.ObjectField(
-            properties={
-                "first_name": opensearch_fields.KeywordField(),
-                "last_name": opensearch_fields.KeywordField(),
-                "dob": opensearch_fields.DateField(),
-            }
-        )
+        group = opensearch_fields.ObjectField(properties={
+            'id': opensearch_fields.KeywordField(),
+            'code': opensearch_fields.KeywordField(),
+            'json_ext': opensearch_fields.ObjectField(),
+        })
+        individual = opensearch_fields.ObjectField(properties={
+            'first_name': opensearch_fields.KeywordField(),
+            'last_name': opensearch_fields.KeywordField(),
+            'dob': opensearch_fields.DateField(),
+        })
         role = opensearch_fields.KeywordField()
-        recipient_type = opensearch_fields.KeywordField()
+        recipient_type = opensearch_fields.KeywordField(),
         json_ext = opensearch_fields.ObjectField()
 
         class Index:
-            name = "group_individual"
+            name = 'group_individual'
             settings = {
-                "number_of_shards": 1,
-                "number_of_replicas": 0,
+                'number_of_shards': 1,
+                'number_of_replicas': 0
             }
             auto_refresh = auto_refresh
 
@@ -135,37 +88,36 @@ if "opensearch_reports" in apps.app_configs:
             model = GroupIndividual
             related_models = [Group, Individual]
             fields = [
-                "id",
+                'id'
             ]
-            queryset_pagination = 1000
+            queryset_pagination = 5000
 
         def get_instances_from_related(self, related_instance):
             if isinstance(related_instance, Group):
-                return GroupIndividual.objects.filter(group=related_instance)
-            if isinstance(related_instance, Individual):
+                return GroupIndividual.objects.filter(
+                    group=related_instance
+                )
+            elif isinstance(related_instance, Individual):
                 return GroupIndividual.objects.filter(individual=related_instance)
-            return None
-
-        INDEXED_JSON_KEYS = [
-            # ONLY keys you need for OS dashboards/search here
-
-        ]
 
         def prepare_json_ext(self, instance):
-            jx = instance.json_ext or {}
-            if not isinstance(jx, dict):
-                return {}
-            if not self.INDEXED_JSON_KEYS:
-                # If you don't need json_ext indexed for GroupIndividual, keep empty
-                return {}
-            return {k: jx.get(k) for k in self.INDEXED_JSON_KEYS}
+            json_ext_data = instance.json_ext
+            json_data = self.__flatten_dict(json_ext_data)
+            return json_data
+
+        def __flatten_dict(self, d, parent_key='', sep='__'):
+            items = {}
+            for k, v in d.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                if isinstance(v, dict):
+                    items.update(self.__flatten_dict(v, new_key, sep=sep))
+                else:
+                    items[new_key] = v
+            return items
 
     @registry.register_document
     class IndividualDataSourceDocument(BaseSyncDocument):
-        """
-        Index for import/upload tracking.
-        """
-        DASHBOARD_NAME = "DataUpdates"
+        DASHBOARD_NAME = 'DataUpdates'
 
         source_name = opensearch_fields.KeywordField()
         source_type = opensearch_fields.KeywordField()
@@ -174,16 +126,16 @@ if "opensearch_reports" in apps.app_configs:
         error = opensearch_fields.ObjectField()
 
         class Index:
-            name = "individual_data_source_upload"
+            name = 'individual_data_source_upload'
             settings = {
-                "number_of_shards": 1,
-                "number_of_replicas": 0,
+                'number_of_shards': 1,
+                'number_of_replicas': 0
             }
             auto_refresh = auto_refresh
 
         class Django:
             model = IndividualDataSourceUpload
             fields = [
-                "id",
+                'id'
             ]
-            queryset_pagination = 1000
+            queryset_pagination = 5000
