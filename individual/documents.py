@@ -26,7 +26,7 @@ if 'opensearch_reports' in apps.app_configs:
         last_name = opensearch_fields.KeywordField()
         dob = opensearch_fields.DateField()
         date_created = opensearch_fields.DateField()
-        json_ext = opensearch_fields.ObjectField()
+        json_ext = opensearch_fields.ObjectField(dynamic=False)
 
         class Index:
             name = 'individual'
@@ -65,7 +65,7 @@ if 'opensearch_reports' in apps.app_configs:
         group = opensearch_fields.ObjectField(properties={
             'id': opensearch_fields.KeywordField(),
             'code': opensearch_fields.KeywordField(),
-            'json_ext': opensearch_fields.ObjectField(),
+            'json_ext': opensearch_fields.ObjectField(dynamic=False),
         })
         individual = opensearch_fields.ObjectField(properties={
             'first_name': opensearch_fields.KeywordField(),
@@ -74,7 +74,7 @@ if 'opensearch_reports' in apps.app_configs:
         })
         role = opensearch_fields.KeywordField()
         recipient_type = opensearch_fields.KeywordField(),
-        json_ext = opensearch_fields.ObjectField()
+        json_ext = opensearch_fields.ObjectField(dynamic=False)
 
         class Index:
             name = 'group_individual'
