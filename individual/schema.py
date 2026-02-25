@@ -208,8 +208,8 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         is_non_consented = kwargs.get("isNonConsented", None)
 
         non_consented_q = (
-            Q(json_ext__json_ext__consent_res=2)
-            | Q(json_ext__json_ext__consent_res="2")
+            Q(json_ext__consent_res=2)
+            | Q(json_ext__consent_res="2")
         )
 
         if is_non_consented is True:
@@ -583,9 +583,9 @@ class IndividualFilterSet(django_filters.FilterSet):
 
     IMPORTANT:
     Your DB query shows the real path is:
-      Json_ext -> 'json_ext' ->> 'consent_res'
+      Json_ext -> 'consent_res' (flat structure)
     So the Django ORM JSONField path must be:
-      json_ext__json_ext__consent_res
+      json_ext__consent_res
     """
 
     is_non_consented = django_filters.BooleanFilter(method="filter_is_non_consented")
@@ -595,8 +595,8 @@ class IndividualFilterSet(django_filters.FilterSet):
             return queryset
 
         non_consented_q = (
-            Q(json_ext__json_ext__consent_res=2)
-            | Q(json_ext__json_ext__consent_res="2")
+            Q(json_ext__consent_res=2)
+            | Q(json_ext__consent_res="2")
         )
 
         if value is True:

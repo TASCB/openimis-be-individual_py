@@ -50,9 +50,9 @@ class IndividualFilterSet(django_filters.FilterSet):
             Q(json_ext__contains={"is_non_consented": True})
             | Q(json_ext__contains={"isNonConsented": True})
 
-            # real storage: json_ext.json_ext.consent_res
-            | Q(json_ext__json_ext__consent_res=2)
-            | Q(json_ext__json_ext__consent_res="2")
+            # real storage: json_ext.consent_res (flat structure)
+            | Q(json_ext__consent_res=2)
+            | Q(json_ext__consent_res="2")
         )
 
 
@@ -100,8 +100,7 @@ class IndividualGQLType(DjangoObjectType):
             return None
 
         ext = getattr(self, "json_ext", None) or {}
-        nested = ext.get("json_ext") or {}
-        raw = nested.get("raw") or {}
+        raw = ext.get("raw") or {}  # Flat structure: raw is at top level of json_ext
 
         v = raw.get("TF4_NO") or raw.get("tf4_no")
         return str(v) if v is not None else None
@@ -115,16 +114,12 @@ class IndividualGQLType(DjangoObjectType):
             return None
 
         ext = getattr(self, "json_ext", None) or {}
-        nested = ext.get("json_ext") or {}
-        raw = nested.get("raw") or {}
+        raw = ext.get("raw") or {}  # Flat structure
 
         v = (
             ext.get("external_id")
             or ext.get("interview_key")
             or ext.get("interviewKey")
-            or nested.get("external_id")
-            or nested.get("interview_key")
-            or nested.get("interviewKey")
             or raw.get("external_id")
             or raw.get("interview_key")
             or raw.get("interviewKey")

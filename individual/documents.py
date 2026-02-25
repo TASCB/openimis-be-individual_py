@@ -73,7 +73,7 @@ if 'opensearch_reports' in apps.app_configs:
             'dob': opensearch_fields.DateField(),
         })
         role = opensearch_fields.KeywordField()
-        recipient_type = opensearch_fields.KeywordField(),
+        recipient_type = opensearch_fields.KeywordField()
         json_ext = opensearch_fields.ObjectField(dynamic=False)
 
         class Index:
