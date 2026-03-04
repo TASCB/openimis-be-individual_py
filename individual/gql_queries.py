@@ -9,7 +9,7 @@ from core import prefix_filterset, ExtendedConnection
 from core.gql_queries import UserGQLType
 from individual.apps import IndividualConfig
 from individual.models import Individual, IndividualDataSource, Group, GroupIndividual, \
-    IndividualDataSourceUpload, IndividualDataUploadRecords, GroupDataSource
+    IndividualDataSourceUpload, IndividualDataUploadRecords, GroupDataSource, PmtConfig, PmtEnrollment, PmtRunProgress
 
 
 def _have_permissions(user, permission):
@@ -205,11 +205,35 @@ class GroupGQLType(DjangoObjectType):
     head = graphene.Field(IndividualGQLType)
 
     def resolve_head(self, info):
-        return Individual.objects.filter(
+        """
+        Resolve the head individual of this group.
+        Applies consent filtering for consistency with resolve_group().
+        """
+        # Get the isNonConsented parameter from parent query context
+        is_non_consented = False
+        try:
+            if hasattr(info, 'variable_values') and info.variable_values:
+                is_non_consented = info.variable_values.get("isNonConsented", False)
+        except Exception:
+            pass
+
+        queryset = Individual.objects.filter(
             groupindividuals__group__id=self.id,
             groupindividuals__role=GroupIndividual.Role.HEAD,
             groupindividuals__is_deleted=False,
-        ).first()
+        )
+
+        # Apply consent filtering (exclude non-consented by default)
+        if not is_non_consented:
+            non_consented_q = (
+                Q(json_ext__consent_res=2) | Q(json_ext__consent_res="2")
+            )
+            queryset = queryset.exclude(non_consented_q)
+
+        # Performance optimization
+        queryset = queryset.select_related('location')
+
+        return queryset.first()
 
     class Meta:
         model = Group
@@ -236,11 +260,35 @@ class GroupHistoryGQLType(DjangoObjectType):
     head = graphene.Field(IndividualGQLType)
 
     def resolve_head(self, info):
-        return Individual.objects.filter(
+        """
+        Resolve the head individual of this group (historical version).
+        Applies consent filtering for consistency with resolve_group().
+        """
+        # Get the isNonConsented parameter from parent query context
+        is_non_consented = False
+        try:
+            if hasattr(info, 'variable_values') and info.variable_values:
+                is_non_consented = info.variable_values.get("isNonConsented", False)
+        except Exception:
+            pass
+
+        queryset = Individual.objects.filter(
             groupindividuals__group__id=self.id,
             groupindividuals__role=GroupIndividual.Role.HEAD,
             groupindividuals__is_deleted=False,
-        ).first()
+        )
+
+        # Apply consent filtering (exclude non-consented by default)
+        if not is_non_consented:
+            non_consented_q = (
+                Q(json_ext__consent_res=2) | Q(json_ext__consent_res="2")
+            )
+            queryset = queryset.exclude(non_consented_q)
+
+        # Performance optimization
+        queryset = queryset.select_related('location')
+
+        return queryset.first()
 
     def resolve_user_updated(self, info):
         return self.user_updated
@@ -377,3 +425,179 @@ class GroupSummaryEnrollmentGQLType(graphene.ObjectType):
 
 class GlobalSchemaType(graphene.ObjectType):
     schema = graphene.JSONString()
+
+
+class HouseholdPmtResultType(graphene.ObjectType):
+    """Result type for household PMT data."""
+    group_uuid = graphene.String()
+    group_code = graphene.String()
+    head_uuid = graphene.String()
+    head_name = graphene.String()
+    pmt_score = graphene.Float()
+    pmt_class = graphene.String()
+    number_of_members = graphene.Int()
+    location_code = graphene.String()
+    location_name = graphene.String()
+
+
+class HouseholdPmtResultConnection(graphene.relay.Connection):
+    """Connection type for paginated household PMT results."""
+    total_count = graphene.Int()
+
+    class Meta:
+        node = HouseholdPmtResultType
+
+
+class HouseholdPmtResultsType(graphene.ObjectType):
+    """Result type for household PMT query with pagination info."""
+    households = graphene.List(HouseholdPmtResultType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+    has_previous = graphene.Boolean()
+    offset = graphene.Int()
+    limit = graphene.Int()
+
+
+class PmtConfigGQLType(DjangoObjectType):
+    """GraphQL type for PMT Configuration."""
+    uuid = graphene.String(source='uuid')
+    location_uuid = graphene.String(source='location.uuid')
+    location_name = graphene.String(source='location.name')
+
+    class Meta:
+        model = PmtConfig
+        interfaces = (graphene.relay.Node,)
+        filter_fields = {
+            "id": ["exact"],
+            "location__id": ["exact"],
+            "location__name": ["icontains"],
+            "pmt_cutoff": ["exact", "lt", "lte", "gt", "gte"],
+            "is_active": ["exact"],
+            "date_created": ["exact", "lt", "lte", "gt", "gte"],
+            "date_updated": ["exact", "lt", "lte", "gt", "gte"],
+        }
+        connection_class = ExtendedConnection
+
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return PmtConfig.get_queryset(queryset, info.context.user)
+
+
+class PmtConfigConnection(graphene.relay.Connection):
+    """Connection type for paginated PMT configuration results with relay cursor pagination."""
+    total_count = graphene.Int(description="Total number of PMT configurations")
+
+    class Meta:
+        node = PmtConfigGQLType
+
+
+class PmtEnrollmentGQLType(DjangoObjectType):
+    """GraphQL type for PMT Enrollment."""
+    uuid = graphene.String(source='uuid')
+    group_uuid = graphene.String(source='group.uuid')
+    group_code = graphene.String(source='group.code')
+    head_name = graphene.String()
+
+    def resolve_head_name(self, info):
+        """Get the head individual's name for this group."""
+        try:
+            head = self.group.groupindividuals_set.filter(
+                role='HEAD',
+                is_deleted=False
+            ).first()
+            if head and head.individual:
+                return f"{head.individual.first_name} {head.individual.last_name}"
+        except Exception:
+            pass
+        return None
+
+    class Meta:
+        model = PmtEnrollment
+        interfaces = (graphene.relay.Node,)
+        filter_fields = {
+            "id": ["exact"],
+            "group__id": ["exact"],
+            "group__code": ["icontains"],
+            "pmt_class": ["exact"],
+            "pmt_score": ["exact", "lt", "lte", "gt", "gte"],
+            "status": ["exact"],
+            "enrollment_date": ["exact", "lt", "lte", "gt", "gte"],
+            "date_created": ["exact", "lt", "lte", "gt", "gte"],
+        }
+        connection_class = ExtendedConnection
+
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return PmtEnrollment.get_queryset(queryset, info.context.user)
+
+
+class PmtEnrollmentConnection(graphene.relay.Connection):
+    """Connection type for paginated PMT enrollment results with relay cursor pagination."""
+    total_count = graphene.Int(description="Total number of PMT enrollments")
+
+    class Meta:
+        node = PmtEnrollmentGQLType
+
+
+# Custom types for PMT Audit Summary (PMT Configuration Page)
+class PmtDistrictSummaryType(graphene.ObjectType):
+    """District summary data for PMT audit/configuration view."""
+    district_code = graphene.String()
+    district_name = graphene.String()
+    pmt_cutoff = graphene.Float()
+    poor_count = graphene.Int()
+    non_poor_count = graphene.Int()
+
+
+class PmtAuditSummaryResultType(graphene.ObjectType):
+    """PMT Audit Summary result with pagination."""
+    districts = graphene.List(PmtDistrictSummaryType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+    has_previous = graphene.Boolean()
+    offset = graphene.Int()
+    limit = graphene.Int()
+
+
+# Custom types for PMT Enrollment List (PMT Enrollment Page)
+class PmtHouseholdEnrollmentType(graphene.ObjectType):
+    """Household enrollment data for PMT enrollment list view."""
+    group_uuid = graphene.String()
+    group_code = graphene.String()
+    head_uuid = graphene.String()
+    head_name = graphene.String()
+    pmt_score = graphene.Float()
+    pmt_class = graphene.String()
+    number_of_members = graphene.Int()
+    location_code = graphene.String()
+    location_name = graphene.String()
+
+
+class PmtEnrollmentResultType(graphene.ObjectType):
+    """PMT Enrollment list result with pagination."""
+    households = graphene.List(PmtHouseholdEnrollmentType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+    has_previous = graphene.Boolean()
+    offset = graphene.Int()
+    limit = graphene.Int()
+
+
+# Progress tracking type for PMT Rerun
+class PmtRunProgressType(graphene.ObjectType):
+    """Progress tracking for PMT rerun operations."""
+    mutation_id = graphene.UUID()
+    status = graphene.String()
+    district_code = graphene.String()
+    total_groups = graphene.Int()
+    processed_groups = graphene.Int()
+    total_individuals = graphene.Int()
+    processed_individuals = graphene.Int()
+    poor_groups_found = graphene.Int()
+    enrollments_created = graphene.Int()
+    percentage_complete = graphene.Int()
+    status_message = graphene.String()
+    errors = graphene.List(graphene.String)
+    started_at = graphene.DateTime()
+    completed_at = graphene.DateTime()
+

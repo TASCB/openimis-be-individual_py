@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "gql_group_create_perms": ["180002"],
     "gql_group_update_perms": ["180003"],
     "gql_group_delete_perms": ["180004"],
+    "gql_pmt_rerun_perms": ["180005"],
     "check_individual_update": True,
     "check_individual_delete": True,
     "check_group_individual_update": True,
@@ -62,6 +63,7 @@ class IndividualConfig(AppConfig):
     gql_group_create_perms = None
     gql_group_update_perms = None
     gql_group_delete_perms = None
+    gql_pmt_rerun_perms = None
     check_individual_update = None
     check_individual_delete = None
     check_group_individual_update = None

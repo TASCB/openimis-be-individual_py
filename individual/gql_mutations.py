@@ -3,6 +3,7 @@ from django.core.exceptions import ValidationError, PermissionDenied
 from django.db import transaction
 from django.db.models import Subquery, Q
 from django.utils.translation import gettext as _
+import logging
 
 from core import filter_validity
 from core.gql.gql_mutations.base_mutation import BaseHistoryModelDeleteMutationMixin, BaseMutation, \
@@ -13,6 +14,8 @@ from individual.models import Individual, Group, GroupIndividual
 from individual.services import IndividualService, GroupService, GroupIndividualService, \
     CreateGroupAndMoveIndividualService
 from location.models import Location, LocationManager
+
+logger = logging.getLogger(__name__)
 
 
 class CreateIndividualInputType(OpenIMISMutation.Input):
@@ -619,4 +622,372 @@ class ConfirmGroupEnrollmentMutation(BaseHistoryModelCreateMutationMixin, BaseMu
         return None
 
     class Input(ConfirmIndividualEnrollmentInputType):
+        pass
+
+
+class RerunPmtInputType(OpenIMISMutation.Input):
+    district_code = graphene.String(required=True)
+    region_code = graphene.String(required=False)
+    pmt_cutoff = graphene.Float(required=True)
+
+
+class RerunPmtMutation(OpenIMISMutation):
+    Input = RerunPmtInputType  # Register the Input type
+
+    _mutation_class = "RerunPmtMutation"
+    _mutation_module = "individual"
+
+    ok = graphene.Boolean()
+    errors = graphene.List(graphene.String)
+    updated_individuals = graphene.Int()
+    updated_groups = graphene.Int()
+    mutation_id = graphene.UUID()
+    district_code = graphene.String()
+
+    @classmethod
+    def mutate_and_get_payload(cls, root, info, **input_data):
+        import logging
+        from django.contrib.auth.models import AnonymousUser
+        from django.core.exceptions import PermissionDenied
+
+        logger = logging.getLogger(__name__)
+
+        mutation_id = None
+        try:
+            user = info.context.user if info and info.context else None
+
+            if type(user) is AnonymousUser or not user or not user.id:
+                raise PermissionDenied(_("mutation.authentication_required"))
+
+            if not user.has_perms(IndividualConfig.gql_pmt_rerun_perms):
+                raise PermissionDenied(_("unauthorized"))
+
+            district_code = input_data.get("district_code")
+            region_code = input_data.get("region_code")
+            pmt_cutoff = input_data.get("pmt_cutoff", 11.01)
+
+            # Get mutation_id from OpenIMIS mutation context (keep your logic)
+            mutation_id = getattr(info, "mutation_id", None)
+            if not mutation_id and hasattr(info, "context") and hasattr(info.context, "mutation_id"):
+                mutation_id = info.context.mutation_id
+
+            from individual.pmt_service import PmtService
+            service = PmtService(user)
+
+            result = service.rerun_pmt(
+                district_code=district_code,
+                region_code=region_code,
+                pmt_cutoff=pmt_cutoff,
+                mutation_id=mutation_id,
+            )
+
+            return cls(
+                ok=result.get("success", False),
+                errors=result.get("errors", []),
+                updated_individuals=result.get("updated_individuals", 0),
+                updated_groups=result.get("updated_groups", 0),
+                mutation_id=mutation_id,
+                district_code=district_code,
+            )
+
+        except PermissionDenied as e:
+            logger.warning(f"RerunPmtMutation: Permission denied: {str(e)}")
+            return cls(
+                ok=False,
+                errors=[str(e)],
+                updated_individuals=0,
+                updated_groups=0,
+                mutation_id=mutation_id,
+                district_code=district_code,
+            )
+        except Exception as e:
+            logger.error(f"RerunPmtMutation: Unexpected error: {str(e)}", exc_info=True)
+            return cls(
+                ok=False,
+                errors=[f"Mutation failed: {str(e)}"],
+                updated_individuals=0,
+                updated_groups=0,
+                mutation_id=mutation_id,
+                district_code=district_code,
+            )
+
+
+# ========================
+# PMT Mutations
+# ========================
+
+class CreatePmtConfigInputType(OpenIMISMutation.Input):
+    location_id = graphene.Int(required=True)
+    pmt_cutoff = graphene.Float(required=True)
+    is_active = graphene.Boolean(required=False, default_value=True)
+    json_ext = graphene.types.json.JSONString(required=False)
+
+
+class UpdatePmtConfigInputType(OpenIMISMutation.Input):
+    id = graphene.UUID(required=True)
+    location_id = graphene.Int(required=False)
+    pmt_cutoff = graphene.Float(required=False)
+    is_active = graphene.Boolean(required=False)
+    json_ext = graphene.types.json.JSONString(required=False)
+
+
+class CreatePmtConfigMutation(BaseHistoryModelCreateMutationMixin, BaseMutation):
+    """
+    Create a new PMT Configuration for a location.
+    """
+    _mutation_class = "CreatePmtConfigMutation"
+    _mutation_module = "individual"
+    _model = None  # Will be set in _mutate
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(IndividualConfig.gql_pmt_rerun_perms):
+            raise PermissionDenied(_("unauthorized"))
+
+        # Verify location exists and user has access
+        if 'location_id' in data:
+            location_id = data['location_id']
+            if not LocationManager().is_allowed(user, [location_id]):
+                raise PermissionDenied(_("unauthorized.location"))
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop('client_mutation_id')
+        if "client_mutation_label" in data:
+            data.pop('client_mutation_label')
+
+        from individual.models import PmtConfig
+        from individual.services import PmtConfigService
+
+        service = PmtConfigService(user)
+        result = service.create(data)
+        return result if not result.get('success') else None
+
+    class Input(CreatePmtConfigInputType):
+        pass
+
+
+class UpdatePmtConfigMutation(BaseHistoryModelUpdateMutationMixin, BaseMutation):
+    """
+    Update an existing PMT Configuration.
+    """
+    _mutation_class = "UpdatePmtConfigMutation"
+    _mutation_module = "individual"
+    _model = None  # Will be set in _mutate
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(IndividualConfig.gql_pmt_rerun_perms):
+            raise PermissionDenied(_("unauthorized"))
+
+        # Verify location user has access if being changed
+        if 'location_id' in data:
+            if not LocationManager().is_allowed(user, [data['location_id']]):
+                raise PermissionDenied(_("unauthorized.location"))
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop('client_mutation_id')
+        if "client_mutation_label" in data:
+            data.pop('client_mutation_label')
+
+        from individual.models import PmtConfig
+        from individual.services import PmtConfigService
+
+        service = PmtConfigService(user)
+        result = service.update(data)
+        return result if not result.get('success') else None
+
+    class Input(UpdatePmtConfigInputType):
+        pass
+
+
+class DeletePmtConfigMutation(BaseHistoryModelDeleteMutationMixin, BaseMutation):
+    """
+    Delete a PMT Configuration.
+    """
+    _mutation_class = "DeletePmtConfigMutation"
+    _mutation_module = "individual"
+    _model = None  # Will be set in _mutate
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(IndividualConfig.gql_pmt_rerun_perms):
+            raise PermissionDenied(_("unauthorized"))
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop('client_mutation_id')
+        if "client_mutation_label" in data:
+            data.pop('client_mutation_label')
+
+        from individual.models import PmtConfig
+        from individual.services import PmtConfigService
+
+        service = PmtConfigService(user)
+
+        ids = data.get('ids')
+        if ids:
+            with transaction.atomic():
+                for config_id in ids:
+                    service.delete({'id': config_id})
+
+    class Input(OpenIMISMutation.Input):
+        ids = graphene.List(graphene.UUID)
+
+
+class CreatePmtEnrollmentInputType(OpenIMISMutation.Input):
+    group_id = graphene.UUID(required=True)
+    pmt_class = graphene.String(required=True)
+    pmt_score = graphene.Float(required=True)
+    status = graphene.String(required=False, default_value="PENDING")
+    enrollment_date = graphene.DateTime(required=False)
+    beneficiary_id = graphene.Int(required=False)
+    json_ext = graphene.types.json.JSONString(required=False)
+
+
+class UpdatePmtEnrollmentInputType(OpenIMISMutation.Input):
+    id = graphene.UUID(required=True)
+    group_id = graphene.UUID(required=False)
+    pmt_class = graphene.String(required=False)
+    pmt_score = graphene.Float(required=False)
+    status = graphene.String(required=False)
+    enrollment_date = graphene.DateTime(required=False)
+    beneficiary_id = graphene.Int(required=False)
+    json_ext = graphene.types.json.JSONString(required=False)
+
+
+class CreatePmtEnrollmentMutation(BaseHistoryModelCreateMutationMixin, BaseMutation):
+    """
+    Create a new PMT Enrollment record for a household.
+    """
+    _mutation_class = "CreatePmtEnrollmentMutation"
+    _mutation_module = "individual"
+    _model = None  # Will be set in _mutate
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(IndividualConfig.gql_pmt_rerun_perms):
+            raise PermissionDenied(_("unauthorized"))
+
+        # Verify group exists and user has access
+        if 'group_id' in data:
+            from individual.models import Group
+            try:
+                group = Group.objects.get(id=data['group_id'])
+                if group.location_id and not LocationManager().is_allowed(user, [group.location_id]):
+                    raise PermissionDenied(_("unauthorized.location"))
+            except Group.DoesNotExist:
+                raise ValidationError(_("Group not found"))
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop('client_mutation_id')
+        if "client_mutation_label" in data:
+            data.pop('client_mutation_label')
+
+        from individual.models import PmtEnrollment
+        from individual.services import PmtEnrollmentService
+
+        service = PmtEnrollmentService(user)
+        result = service.create(data)
+        return result if not result.get('success') else None
+
+    class Input(CreatePmtEnrollmentInputType):
+        pass
+
+
+class UpdatePmtEnrollmentMutation(BaseHistoryModelUpdateMutationMixin, BaseMutation):
+    """
+    Update an existing PMT Enrollment record.
+    """
+    _mutation_class = "UpdatePmtEnrollmentMutation"
+    _mutation_module = "individual"
+    _model = None  # Will be set in _mutate
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(IndividualConfig.gql_pmt_rerun_perms):
+            raise PermissionDenied(_("unauthorized"))
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop('client_mutation_id')
+        if "client_mutation_label" in data:
+            data.pop('client_mutation_label')
+
+        from individual.models import PmtEnrollment
+        from individual.services import PmtEnrollmentService
+
+        service = PmtEnrollmentService(user)
+        result = service.update(data)
+        return result if not result.get('success') else None
+
+    class Input(UpdatePmtEnrollmentInputType):
+        pass
+
+
+class DisenrollPmtEnrollmentInputType(OpenIMISMutation.Input):
+    enrollment_id = graphene.UUID(required=True)
+    disenrollment_reason = graphene.String(required=False)
+
+
+class DisenrollPmtEnrollmentMutation(BaseMutation):
+    """
+    Disenroll a household from PMT-based enrollment.
+    Sets enrollment status to DISENROLLED and records disenrollment date/reason.
+    """
+    _mutation_class = "DisenrollPmtEnrollmentMutation"
+    _mutation_module = "individual"
+
+    ok = graphene.Boolean()
+    errors = graphene.List(graphene.String)
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(IndividualConfig.gql_pmt_rerun_perms):
+            raise PermissionDenied(_("unauthorized"))
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop('client_mutation_id')
+        if "client_mutation_label" in data:
+            data.pop('client_mutation_label')
+
+        from individual.models import PmtEnrollment
+        from individual.services import PmtEnrollmentService
+        from django.utils import timezone
+
+        service = PmtEnrollmentService(user)
+
+        enrollment_id = data.get('enrollment_id')
+        disenrollment_reason = data.get('disenrollment_reason', '')
+
+        try:
+            enrollment = PmtEnrollment.objects.get(id=enrollment_id)
+            enrollment.status = PmtEnrollment.Status.DISENROLLED
+            enrollment.disenrollment_date = timezone.now()
+            enrollment.disenrollment_reason = disenrollment_reason
+            enrollment.save(user=user)
+
+            return cls(ok=True, errors=[])
+        except PmtEnrollment.DoesNotExist:
+            return cls(ok=False, errors=["PMT Enrollment not found"])
+        except Exception as e:
+            logger.error(f"Error disenrolling PMT enrollment {enrollment_id}: {str(e)}", exc_info=True)
+            return cls(ok=False, errors=[str(e)])
+
+    class Input(DisenrollPmtEnrollmentInputType):
         pass

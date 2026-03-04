@@ -1,7 +1,7 @@
 from django.db import migrations
 
 
-group_rights = [180001, 180002, 180003, 180004]
+group_rights = [180001, 180002, 180003, 180004, 180005]
 imis_administrator_system = 64
 
 
