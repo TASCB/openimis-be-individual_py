@@ -80,7 +80,7 @@ class PmtService(BaseService):
             return None
 
     def get_households_with_pmt(self, district_code=None, region_code=None, offset=0, limit=10,
-                                 search_text=None, pmt_class=None):
+                                 search_text=None, pmt_class=None, pmt_cutoff=None):
         """
         Fetch households (groups) with PMT data for a district/region.
 
@@ -91,6 +91,7 @@ class PmtService(BaseService):
             limit: Page size
             search_text: Search by group code or head name
             pmt_class: Filter by "POOR" or "NON_POOR"
+            pmt_cutoff: PMT cutoff used for classification (informational, stored in group.json_ext)
 
         Returns:
             dict with households list and metadata (total_count, has_next, has_previous)
@@ -98,11 +99,21 @@ class PmtService(BaseService):
         # Start with groups, applying row-level security
         queryset = Group.get_queryset(Group.objects.filter(is_deleted=False), self.user)
 
-        # Filter by location (district or region)
+        # REQUIRED: Only include groups with PMT data
+        queryset = queryset.filter(json_ext__pmt_class_household__isnull=False)
+
+        # Filter by location (district or region) - include child locations (wards, villages)
         if district_code:
-            queryset = queryset.filter(location__code=district_code)
+            queryset = queryset.filter(
+                Q(location__code=district_code) |  # Level 1: Direct district level
+                Q(location__parent__code=district_code) |  # Level 2: Wards
+                Q(location__parent__parent__code=district_code)  # Level 3: Villages
+            )
         elif region_code:
-            queryset = queryset.filter(location__parent__code=region_code)
+            queryset = queryset.filter(
+                Q(location__code=region_code) |  # Level 1: Direct region level
+                Q(location__parent__code=region_code)  # Level 2: Child districts
+            )
 
         # Filter by PMT class if provided
         if pmt_class in ["POOR", "NON_POOR"]:
@@ -203,10 +214,12 @@ class PmtService(BaseService):
                             "limit": limit,
                         }
 
-                    # Get groups in this district that have PMT data
+                    # Get groups in this district + child locations that have PMT data
                     groups_qs = Group.get_queryset(
                         Group.objects.filter(
-                            location=district,
+                            Q(location=district) |  # Level 1: Direct district level
+                            Q(location__parent=district) |  # Level 2: Wards
+                            Q(location__parent__parent=district),  # Level 3: Villages
                             is_deleted=False,
                             json_ext__pmt_class_household__isnull=False  # KEY: Must have PMT data
                         ),
@@ -275,14 +288,42 @@ class PmtService(BaseService):
                 json_ext__pmt_class_household__isnull=False  # KEY: Must have PMT data
             )
 
-            # Get distinct districts from those groups
-            district_codes_with_pmt = (
-                all_groups_with_pmt
-                .values_list('location__code', flat=True)
-                .distinct()
-            )
+            # Extract parent district code from each group's location
+            # Groups can be at 3 levels: district (D), ward (W), or village (V)
+            # We need to find the parent district for each group
+            from location.models import Location
 
-            if not district_codes_with_pmt:
+            # Get all distinct district locations from groups with PMT data
+            # First, collect all location IDs from groups with PMT data
+            group_location_ids = all_groups_with_pmt.values_list('location_id', flat=True).distinct()
+
+            # Get those locations and traverse to parent district
+            locations = Location.objects.filter(id__in=group_location_ids)
+            district_ids_with_pmt = set()
+
+            for location in locations:
+                # Find the district for this location
+                if location.type == 'D':
+                    # Direct district
+                    district_ids_with_pmt.add(location.id)
+                elif location.type == 'W':
+                    # Ward - parent is district
+                    if location.parent_id:
+                        district_ids_with_pmt.add(location.parent_id)
+                elif location.type == 'V':
+                    # Village - parent.parent is district
+                    if location.parent and location.parent.parent_id:
+                        district_ids_with_pmt.add(location.parent.parent_id)
+                # Handle other types - try traversing up
+                elif location.parent_id:
+                    # Try one level up
+                    parent = location.parent
+                    if parent and parent.type == 'D':
+                        district_ids_with_pmt.add(parent.id)
+                    elif parent and parent.parent_id and parent.parent.type == 'D':
+                        district_ids_with_pmt.add(parent.parent.id)
+
+            if not district_ids_with_pmt:
                 # No districts have been rerun yet
                 return {
                     "districts": [],
@@ -293,33 +334,71 @@ class PmtService(BaseService):
                     "limit": limit,
                 }
 
-            # Get districts by recency (latest rerun first)
-            # For each district, find the max date_updated from its groups with PMT data
+            # Get districts with their latest update times
             districts_with_dates = (
-                Group.objects.filter(
-                    location__code__in=district_codes_with_pmt,
+                Group.objects
+                .filter(
                     is_deleted=False,
                     json_ext__pmt_class_household__isnull=False
                 )
-                .values('location__code', 'location__name', 'location__type')
+                .filter(
+                    Q(location_id__in=district_ids_with_pmt) |  # Direct district
+                    Q(location__parent_id__in=district_ids_with_pmt) |  # Ward level
+                    Q(location__parent__parent_id__in=district_ids_with_pmt)  # Village level
+                )
+                .values('location_id')
                 .annotate(latest_update=Max('date_updated'))
-                .order_by('-latest_update')  # Most recent first
+                .order_by('-latest_update')
             )
 
-            total_count = len(list(districts_with_dates))
+            # Convert back to location objects to get district info
+            all_district_ids = [item['location_id'] for item in districts_with_dates]
+            all_locations = Location.objects.filter(id__in=all_district_ids)
+
+            district_map = {}  # Maps district_id to district location
+            for location in all_locations:
+                if location.type == 'D':
+                    district_map[location.id] = location
+                elif location.type == 'W' and location.parent:
+                    district_map[location.id] = location.parent
+                elif location.type == 'V' and location.parent and location.parent.parent:
+                    district_map[location.id] = location.parent.parent
+
+            # Build final list with latest updates per district
+            districts_by_id = {}
+            for item in districts_with_dates:
+                location_id = item['location_id']
+                district = district_map.get(location_id)
+                if district and district.id not in districts_by_id:
+                    districts_by_id[district.id] = {
+                        'location': district,
+                        'latest_update': item['latest_update']
+                    }
+
+            # Sort by latest_update
+            sorted_districts = sorted(
+                districts_by_id.values(),
+                key=lambda x: x['latest_update'],
+                reverse=True
+            )
+
+            total_count = len(sorted_districts)
 
             # Apply pagination
-            paginated_districts = list(districts_with_dates[offset:offset + limit])
+            paginated_districts = sorted_districts[offset:offset + limit]
 
             districts_data = []
             for item in paginated_districts:
-                location_code = item['location__code']
-                location_name = item['location__name']
+                district = item['location']
+                district_code = district.code
+                district_name = district.name
 
                 # Get counts for this district
                 groups_qs = Group.get_queryset(
                     Group.objects.filter(
-                        location__code=location_code,
+                        Q(location_id=district.id) |  # Level 1: Direct district
+                        Q(location__parent_id=district.id) |  # Level 2: Wards
+                        Q(location__parent__parent_id=district.id),  # Level 3: Villages
                         is_deleted=False,
                         json_ext__pmt_class_household__isnull=False
                     ),
@@ -343,8 +422,8 @@ class PmtService(BaseService):
                     pmt_cutoff_used = latest_group.json_ext.get("pmt_cutoff_used")
 
                 districts_data.append({
-                    "district_code": location_code,
-                    "district_name": location_name,
+                    "district_code": district_code,
+                    "district_name": district_name,
                     "pmt_cutoff": pmt_cutoff_used,
                     "poor_count": counts.get("poor_count", 0) or 0,
                     "non_poor_count": counts.get("non_poor_count", 0) or 0,
@@ -449,11 +528,17 @@ class PmtService(BaseService):
                     "updated_groups": 0,
                 }
 
-            # Fetch all groups (households) in district with row-level security
-            groups = Group.get_queryset(
-                Group.objects.filter(is_deleted=False, location__code=district_code),
-                self.user
+            # Fetch all groups (households) in district + child locations (wards, villages)
+            # Searches 3 levels deep: district → ward → village
+            groups_query = Group.objects.filter(
+                is_deleted=False
+            ).filter(
+                Q(location__code=district_code) |  # Level 1: Groups at district level
+                Q(location__parent__code=district_code) |  # Level 2: Groups at ward level
+                Q(location__parent__parent__code=district_code)  # Level 3: Groups at village level
             )
+
+            groups = Group.get_queryset(groups_query, self.user)
 
             # Convert to list to count and iterate
             groups_list = list(groups)
@@ -661,9 +746,11 @@ class PmtService(BaseService):
         try:
             logger.info(f"Starting auto-enrollment workflow for district {district_code}")
 
-            # Find all groups with POOR classification
+            # Find all groups with POOR classification (including child locations)
             poor_groups = Group.objects.filter(
-                location__code=district_code,
+                Q(location__code=district_code) |  # Level 1: Direct district level
+                Q(location__parent__code=district_code) |  # Level 2: Wards
+                Q(location__parent__parent__code=district_code),  # Level 3: Villages
                 is_deleted=False,
                 json_ext__pmt_class_household="POOR"
             )

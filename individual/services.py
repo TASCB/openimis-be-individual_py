@@ -725,6 +725,225 @@ class GroupAndGroupIndividualAlignmentService:
         old_primary.save(user=self.user)
 
 
+def get_individual_duplication_aggregation(columns, location_id=None):
+    """
+    Find duplicate individuals based on specified columns.
+
+    Args:
+        columns: List of field names to group by (e.g., ['first_name', 'last_name'])
+        location_id: Optional location filter (integer ID or string)
+
+    Returns:
+        List of groups with count > 1 (actual duplicates)
+    """
+    from django.contrib.postgres.aggregates import ArrayAgg
+
+    if not columns:
+        return []
+
+    # Separate model fields from json_ext fields
+    model_columns, json_columns = _resolve_individual_columns(columns)
+
+    if not model_columns:
+        return []
+
+    query = Individual.objects.filter(is_deleted=False)
+
+    # Handle location_id filtering - convert string to int if needed
+    if location_id:
+        try:
+            # location_id should be an integer, but handle string input
+            if isinstance(location_id, str):
+                location_id = int(location_id)
+            query = query.filter(location_id=location_id)
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid location_id provided: {location_id}")
+            # Continue without location filter if invalid
+
+    # Group by model columns
+    grouped = query.values(*model_columns).annotate(
+        count=Count('id'),
+        ids=ArrayAgg('id')
+    ).filter(count__gt=1)
+
+    # Format results
+    results = []
+    for group in grouped:
+        results.append({
+            'count': group['count'],
+            'ids': [str(id_) for id_ in group['ids']],
+            'column_values': {col: group.get(col) for col in model_columns}
+        })
+
+    return results
+
+
+def _resolve_individual_columns(columns):
+    """
+    Separate database model fields from json_ext fields.
+
+    Returns:
+        Tuple of (model_columns, json_columns)
+    """
+    model_columns = []
+    json_columns = []
+
+    for col in columns:
+        if _is_individual_model_column(col):
+            model_columns.append(col)
+        else:
+            json_columns.append(col)
+
+    return model_columns, json_columns
+
+
+def _is_individual_model_column(column_name):
+    """Check if a column exists as a direct model field on Individual."""
+    try:
+        Individual._meta.get_field(column_name)
+        return True
+    except Exception:
+        return False
+
+
+class CreateDeduplicationIndividualReviewTasksService:
+    """Service for creating deduplication review tasks for individuals."""
+
+    def __init__(self, user, validation_class=None):
+        self.user = user
+        self.validation_class = validation_class
+
+    def create_individual_duplication_tasks(self, summary):
+        """
+        Create deduplication review tasks from duplicate summary.
+
+        Args:
+            summary: List of duplicate group objects from frontend
+
+        Returns:
+            Success/error response
+        """
+        from tasks_management.services import TaskService
+        from tasks_management.apps import TasksManagementConfig
+
+        try:
+            task_service = TaskService(self.user)
+
+            # Flatten summary into task data
+            if not summary:
+                return output_result_success(detail="No duplicates to process")
+
+            # Extract all IDs from summary
+            all_ids = set()
+            for item in summary:
+                ids = item.get('ids', [])
+                if isinstance(ids, list):
+                    all_ids.update(ids)
+
+            task_data = {
+                'source': self.__class__.__name__,
+                'executor_action_event': TasksManagementConfig.default_executor_event,
+                'business_data_serializer': f'{self.__class__.__module__}.{self.__class__.__name__}.create_individual_duplication_task_serializer',
+                'business_event': '',
+                'data': {
+                    'ids': list(all_ids),
+                    'column_values': summary[0].get('column_values', {}) if summary else {},
+                    'count': len(summary)
+                }
+            }
+
+            result = task_service.create(task_data)
+            return result
+
+        except Exception as exc:
+            return output_exception(
+                model_name='Individual',
+                method='create_individual_duplication_tasks',
+                exception=exc
+            )
+
+    @staticmethod
+    def create_individual_duplication_task_serializer(data):
+        """Format task data for display in task management UI."""
+        def serialize(key, value):
+            if key == 'ids':
+                # Convert IDs to individual names
+                individuals = Individual.objects.filter(id__in=value)
+                return ', '.join([f"{i.first_name} {i.last_name}" for i in individuals])
+            if key == 'column_values':
+                return json.dumps(value) if isinstance(value, dict) else str(value)
+            return value
+
+        serialized_data = crud_business_data_builder(data, serialize)
+        return serialized_data
+
+    @classmethod
+    def get_class_name(cls):
+        return cls.__name__
+
+
+@transaction.atomic
+def merge_duplicate_individuals(task_data, user):
+    """
+    Merge duplicate individuals into the primary record.
+
+    Called when a deduplication task is completed. Can be triggered by:
+    - Task management system on task completion
+    - Manual invocation after task review
+
+    Args:
+        task_data: Dictionary with task business data containing:
+                   - 'primary_id': UUID of individual to keep
+                   - 'ids': List of all duplicate individual IDs
+        user: User performing the merge
+    """
+    primary_id = task_data.get('primary_id')
+    duplicate_ids = task_data.get('ids', [])
+
+    if not primary_id:
+        logger.warning("No primary_id specified in deduplication task data")
+        return
+
+    try:
+        primary = Individual.objects.get(id=primary_id)
+        duplicates = Individual.objects.filter(
+            id__in=duplicate_ids
+        ).exclude(id=primary_id)
+
+        for duplicate in duplicates:
+            # Transfer GroupIndividual relationships
+            GroupIndividual.objects.filter(
+                individual=duplicate,
+                is_deleted=False
+            ).update(individual=primary)
+
+            # Transfer Beneficiary relationships if module installed
+            try:
+                from social_protection.models import Beneficiary
+                Beneficiary.objects.filter(
+                    individual=duplicate,
+                    is_deleted=False
+                ).update(individual=primary)
+            except ImportError:
+                pass  # Module not installed
+
+            # Soft delete duplicate
+            duplicate.is_deleted = True
+            duplicate.save(user=user)
+
+        logger.info(
+            f"Successfully merged {len(duplicates)} duplicate individuals into {primary_id}"
+        )
+
+    except Individual.DoesNotExist:
+        logger.error(f"Primary individual {primary_id} not found")
+    except Exception as exc:
+        logger.exception(
+            "Error merging duplicate individuals",
+            exc_info=True
+        )
+
+
 class IndividualImportService:
     import_loaders = {
         # .csv

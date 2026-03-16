@@ -12,7 +12,7 @@ from core.schema import OpenIMISMutation
 from individual.apps import IndividualConfig
 from individual.models import Individual, Group, GroupIndividual
 from individual.services import IndividualService, GroupService, GroupIndividualService, \
-    CreateGroupAndMoveIndividualService
+    CreateGroupAndMoveIndividualService, CreateDeduplicationIndividualReviewTasksService
 from location.models import Location, LocationManager
 
 logger = logging.getLogger(__name__)
@@ -991,3 +991,50 @@ class DisenrollPmtEnrollmentMutation(BaseMutation):
 
     class Input(DisenrollPmtEnrollmentInputType):
         pass
+
+
+class CreateDeduplicationIndividualReviewMutation(OpenIMISMutation):
+    """
+    Create a deduplication review task for individuals.
+    Allows users to identify and merge duplicate individual records.
+    """
+    _mutation_class = "CreateDeduplicationIndividualReviewMutation"
+    _mutation_module = "individual"
+
+    ok = graphene.Boolean()
+    errors = graphene.List(graphene.String)
+
+    class Input(OpenIMISMutation.Input):
+        summary = graphene.List(graphene.JSONString, required=True)
+
+    @classmethod
+    def _validate(cls, info, **input_data):
+        """Validate user authentication and permissions."""
+        user = info.context.user
+        if not user or not user.is_authenticated:
+            raise PermissionDenied(_("mutation.authentication_required"))
+
+        if not user.has_perms(IndividualConfig.gql_individual_update_perms):
+            raise PermissionDenied(_("unauthorized"))
+
+    @classmethod
+    def mutate_and_get_payload(cls, root, info, **input_data):
+        """Create deduplication review task."""
+        try:
+            cls._validate(info, **input_data)
+
+            summary = input_data.get('summary')
+            service = CreateDeduplicationIndividualReviewTasksService(info.context.user)
+            result = service.create_individual_duplication_tasks(summary)
+
+            return cls(
+                ok=result.get('success', False),
+                errors=result.get('errors', [])
+            )
+
+        except PermissionDenied as e:
+            logger.warning(f"CreateDeduplicationIndividualReviewMutation: Permission denied: {str(e)}")
+            return cls(ok=False, errors=[str(e)])
+        except Exception as e:
+            logger.error(f"CreateDeduplicationIndividualReviewMutation: Unexpected error: {str(e)}", exc_info=True)
+            return cls(ok=False, errors=[f"Mutation failed: {str(e)}"])
