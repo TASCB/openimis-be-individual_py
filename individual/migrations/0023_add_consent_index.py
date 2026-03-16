@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('individual', '0018_alter_groupindividual_role_and_more'),
+        ('individual', '0022_pmtrunprogress'),
     ]
 
     operations = [
