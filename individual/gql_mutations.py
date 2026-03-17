@@ -632,7 +632,7 @@ class RerunPmtInputType(OpenIMISMutation.Input):
 
 
 class RerunPmtMutation(OpenIMISMutation):
-    Input = RerunPmtInputType  # Register the Input type
+    Input = RerunPmtInputType 
 
     _mutation_class = "RerunPmtMutation"
     _mutation_module = "individual"
@@ -647,12 +647,15 @@ class RerunPmtMutation(OpenIMISMutation):
     @classmethod
     def mutate_and_get_payload(cls, root, info, **input_data):
         import logging
+        import uuid
         from django.contrib.auth.models import AnonymousUser
         from django.core.exceptions import PermissionDenied
 
         logger = logging.getLogger(__name__)
 
+        district_code = input_data.get("district_code")
         mutation_id = None
+
         try:
             user = info.context.user if info and info.context else None
 
@@ -662,30 +665,33 @@ class RerunPmtMutation(OpenIMISMutation):
             if not user.has_perms(IndividualConfig.gql_pmt_rerun_perms):
                 raise PermissionDenied(_("unauthorized"))
 
-            district_code = input_data.get("district_code")
             region_code = input_data.get("region_code")
             pmt_cutoff = input_data.get("pmt_cutoff", 11.01)
 
-            # Get mutation_id from OpenIMIS mutation context (keep your logic)
-            mutation_id = getattr(info, "mutation_id", None)
-            if not mutation_id and hasattr(info, "context") and hasattr(info.context, "mutation_id"):
-                mutation_id = info.context.mutation_id
+            # Generate a mutation_id for progress tracking
+            mutation_id = str(uuid.uuid4())
 
-            from individual.pmt_service import PmtService
-            service = PmtService(user)
-
-            result = service.rerun_pmt(
+            # Dispatch async Celery task — returns immediately, no timeout
+            from individual.tasks import rerun_pmt_task
+            rerun_pmt_task.delay(
                 district_code=district_code,
                 region_code=region_code,
-                pmt_cutoff=pmt_cutoff,
+                pmt_cutoff=float(pmt_cutoff),
+                user_id=str(user.id),
                 mutation_id=mutation_id,
             )
 
+            logger.info(
+                f"RerunPmtMutation: dispatched async task "
+                f"district={district_code}, mutation_id={mutation_id}"
+            )
+
+            # Return immediately — frontend polls PmtRunProgress for completion
             return cls(
-                ok=result.get("success", False),
-                errors=result.get("errors", []),
-                updated_individuals=result.get("updated_individuals", 0),
-                updated_groups=result.get("updated_groups", 0),
+                ok=True,
+                errors=[],
+                updated_individuals=0,
+                updated_groups=0,
                 mutation_id=mutation_id,
                 district_code=district_code,
             )
@@ -701,7 +707,9 @@ class RerunPmtMutation(OpenIMISMutation):
                 district_code=district_code,
             )
         except Exception as e:
-            logger.error(f"RerunPmtMutation: Unexpected error: {str(e)}", exc_info=True)
+            logger.error(
+                f"RerunPmtMutation: Unexpected error: {str(e)}", exc_info=True
+            )
             return cls(
                 ok=False,
                 errors=[f"Mutation failed: {str(e)}"],
