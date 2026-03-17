@@ -15,6 +15,7 @@ This service handles:
 import logging
 import time
 from datetime import datetime
+from django.core.exceptions import ValidationError
 from django.db import transaction, IntegrityError
 from django.db.models import Count, Q, Max
 from django.utils import timezone
@@ -624,7 +625,11 @@ class PmtService(BaseService):
                     head.json_ext["pmt_score"] = new_pmt_score
                     if new_pmt_class:
                         head.json_ext["pmt_class"] = new_pmt_class
-                    head.save(user=self.user)
+                    try:
+                        head.save(user=self.user)
+                    except ValidationError as ve:
+                        if 'no changes in fields' not in str(ve):
+                            raise
                     updated_individuals_count += 1
 
                     # Update all other household members with same PMT
@@ -633,7 +638,11 @@ class PmtService(BaseService):
                         member.json_ext["pmt_score"] = new_pmt_score
                         if new_pmt_class:
                             member.json_ext["pmt_class"] = new_pmt_class
-                        member.save(user=self.user)
+                        try:
+                            member.save(user=self.user)
+                        except ValidationError as ve:
+                            if 'no changes in fields' not in str(ve):
+                                raise
                         updated_individuals_count += 1
 
                     # Update group with household-level PMT (mirrors HEAD's PMT)
@@ -644,7 +653,11 @@ class PmtService(BaseService):
                     # Store the cutoff actually used for this rerun (so audit summary can display it)
                     group.json_ext["pmt_cutoff_used"] = float(pmt_cutoff)
 
-                    group.save(user=self.user)
+                    try:
+                        group.save(user=self.user)
+                    except ValidationError as ve:
+                        if 'no changes in fields' not in str(ve):
+                            raise
                     updated_groups_count += 1
 
                     # Update progress every 10 groups to avoid excessive database writes
