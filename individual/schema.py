@@ -62,6 +62,8 @@ from individual.gql_queries import (
     PmtAuditSummaryResultType,
     PmtEnrollmentResultType,
     PmtRunProgressType,
+    apply_non_consented_filter,
+    non_consented_marker_q,
 )
 from individual.models import (
     Individual,
@@ -114,6 +116,12 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         isNonConsented=graphene.Boolean(
             description="Filter for non-consented individuals (true=non-consented only, false/null=consented)"
         ),
+        groupPmtEligible=graphene.Boolean(
+            description="Filter individuals by their group's PMT eligibility (true=PMT eligible groups only, false=non-eligible)"
+        ),
+        groupIsNonConsented=graphene.Boolean(
+            description="Filter individuals by their group's consent status (true=non-consented groups only, false=consented)"
+        ),
     )
 
     individual_history = OrderedDjangoFilterConnectionField(
@@ -161,6 +169,10 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         isNonConsented=graphene.Boolean(
             description="Filter by head's consent status (true=non-consented only, false/null=consented)"
         ),
+        pmtScoreHousehold_Lte=graphene.Float(),
+        pmtScoreHousehold_Lt=graphene.Float(),
+        pmtClassHousehold=graphene.String(),
+        pmtEligible=graphene.Boolean(),
     )
 
     group_history = OrderedDjangoFilterConnectionField(
@@ -232,7 +244,7 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
 
     pmt_enrollment_list = graphene.Field(
         PmtEnrollmentResultType,
-        district_code=graphene.String(required=False),  # Can come from location filter
+        district_code=graphene.String(required=False),
         pmt_cutoff=graphene.Float(required=True),
         region_code=graphene.String(required=False),
         offset=graphene.Int(required=False),
@@ -310,31 +322,48 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
 
         # ---- Consent filtering (positive filter, no negation) ----
         is_non_consented = kwargs.get("isNonConsented", None)
-        if is_non_consented is not None:
-            if is_non_consented is True:
-                # Show non-consented: consent_res = 2 (legacy) OR is_non_consented = true (new)
-                marker_q = (
-                    Q(json_ext__contains={"is_non_consented": True})
-                    | Q(json_ext__contains={"isNonConsented": True})
-                    | Q(json_ext__consent_res__in=[2, "2"])
+        apply_individual_consent_filter = is_non_consented is not None
+
+        # ---- Group-level PMT eligibility filtering for Eligible Members page ----
+        group_pmt_eligible = kwargs.get("groupPmtEligible", None)
+        if group_pmt_eligible is not None:
+            if group_pmt_eligible is True:
+                # Show only individuals whose group is PMT-eligible (POOR class)
+                filters.append(
+                    Q(groupindividuals__group__json_ext__pmt_class_household="POOR",
+                      groupindividuals__is_deleted=False)
                 )
-                filters.append(marker_q)
             else:
-                # Show consented: use positive filter instead of negation
-                # Supports multiple marker formats for backwards compatibility
-                marker_q = (
-                    Q(json_ext__contains={"is_non_consented": False})
-                    | Q(json_ext__contains={"isNonConsented": False})
-                    | Q(json_ext__consent_res__in=[1])
-                    | Q(json_ext__consent_res__isnull=True)
+                # Show only individuals whose group is NOT PMT-eligible (NON_POOR class)
+                filters.append(
+                    Q(groupindividuals__group__json_ext__pmt_class_household="NON_POOR",
+                      groupindividuals__is_deleted=False)
                 )
-                filters.append(marker_q)
+
+        # ---- Group-level consent filtering for Eligible Members page ----
+        group_is_non_consented = kwargs.get("groupIsNonConsented", None)
+        if group_is_non_consented is not None:
+            head_q = Q(
+                groupindividuals__group__groupindividuals__role=GroupIndividual.Role.HEAD,
+                groupindividuals__group__groupindividuals__is_deleted=False,
+                groupindividuals__is_deleted=False
+            )
+            marker_q = non_consented_marker_q(
+                "groupindividuals__group__groupindividuals__individual__json_ext"
+            )
+            if group_is_non_consented is True:
+                # Show only individuals from non-consented groups
+                filters.append(head_q & marker_q)
+            else:
+                # Show only individuals from consented groups
+                filters.append(head_q & ~marker_q)
 
         query = IndividualGQLType.get_queryset(None, info)
         query = query.filter(*filters)
+        if apply_individual_consent_filter:
+            query = apply_non_consented_filter(query, is_non_consented)
 
         # OPTIMIZATION: Add explicit relationship loading for better performance with 10M+ data
-        # Follows pattern from resolve_group which has this optimization
         query = query.select_related('location')
 
         custom_filters = kwargs.get("customFilters", None)
@@ -348,18 +377,13 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
 
         return gql_optimizer.query(query, info)
 
-    # -------------------------------
-    # progress resolver
-    # -------------------------------
     def resolve_individual_deduplication_summary(self, info, columns=None, location_id=None, **kwargs):
-        """Query duplicate individuals based on specified columns."""
         from individual.services import get_individual_duplication_aggregation
         import logging
 
         logger = logging.getLogger(__name__)
 
         try:
-            # Check permissions
             Query._check_permissions(
                 info.context.user,
                 IndividualConfig.gql_individual_search_perms
@@ -367,10 +391,8 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
 
             logger.debug(f"Dedup summary query - columns: {columns}, location_id: {location_id}")
 
-            # Get aggregation results
             results = get_individual_duplication_aggregation(columns, location_id)
 
-            # Format as JSON for GraphQL
             return json.dumps({
                 'rows': results
             })
@@ -379,10 +401,8 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
             raise
 
     def resolve_pmt_run_progress(self, info, mutation_id, **kwargs):
-        """Get progress of a PMT rerun operation by mutation ID."""
         from individual.models import PmtRunProgress
 
-        # Permissions: PMT rerun rights are appropriate here
         Query._check_permissions(info.context.user, IndividualConfig.gql_pmt_rerun_perms)
 
         try:
@@ -406,7 +426,6 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         except PmtRunProgress.DoesNotExist:
             return None
 
- 
     def resolve_individual_enrollment_summary(self, info, **kwargs):
         Query._check_permissions(
             info.context.user, IndividualConfig.gql_individual_search_perms
@@ -525,6 +544,7 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
             info.context.user, IndividualConfig.gql_group_search_perms
         )
         filters = append_validity_filter(**kwargs)
+
         client_mutation_id = kwargs.get("client_mutation_id", None)
         if client_mutation_id:
             wait_for_mutation(client_mutation_id)
@@ -558,36 +578,52 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
                 Query._get_location_filters(parent_location, parent_location_level)
             )
 
-        # ---- Consent filtering (positive filter, no negation) ----
+        # ---- Consent filtering for normal Group page ----
+        # Business rule:
+        # - normal Group page should show consented groups
+        # - non-consented page uses its own dedicated fetch path
         is_non_consented = kwargs.get("isNonConsented", None)
         if is_non_consented is not None:
+            head_q = Q(
+                groupindividuals__role=GroupIndividual.Role.HEAD,
+                groupindividuals__is_deleted=False
+            )
+            marker_q = non_consented_marker_q("groupindividuals__individual__json_ext")
             if is_non_consented is True:
-                # Show groups with non-consented heads
-                non_consented_head_q = Q(
-                    groupindividuals__role=GroupIndividual.Role.HEAD,
-                    groupindividuals__individual__json_ext__consent_res__in=[2, "2"],
-                    groupindividuals__is_deleted=False
-                )
-                filters.append(non_consented_head_q)
+                filters.append(head_q & marker_q)
             else:
-                # Show groups with consented heads (positive filter instead of negation)
-                consented_head_q = Q(
-                    groupindividuals__role=GroupIndividual.Role.HEAD,
-                    groupindividuals__is_deleted=False
-                ) & (
-                    Q(groupindividuals__individual__json_ext__contains={"is_non_consented": False})
-                    | Q(groupindividuals__individual__json_ext__contains={"isNonConsented": False})
-                    | Q(groupindividuals__individual__json_ext__consent_res__in=[1])
-                    | Q(groupindividuals__individual__json_ext__consent_res__isnull=True)
-                )
-                filters.append(consented_head_q)
+                filters.append(head_q & ~marker_q)
+
+        # ---- PMT household filters for Eligible Households page ----
+        pmt_score_household_lte = kwargs.get("pmtScoreHousehold_Lte")
+        if pmt_score_household_lte is not None:
+            filters.append(
+                Q(json_ext__pmt_score_household__lte=pmt_score_household_lte)
+            )
+
+        pmt_score_household_lt = kwargs.get("pmtScoreHousehold_Lt")
+        if pmt_score_household_lt is not None:
+            filters.append(
+                Q(json_ext__pmt_score_household__lt=pmt_score_household_lt)
+            )
+
+        pmt_class_household = kwargs.get("pmtClassHousehold")
+        if pmt_class_household:
+            filters.append(
+                Q(json_ext__pmt_class_household=pmt_class_household)
+            )
+
+        pmt_eligible = kwargs.get("pmtEligible")
+        if pmt_eligible is True:
+            filters.append(
+                Q(json_ext__pmt_class_household="POOR")
+            )
+        elif pmt_eligible is False:
+            filters.append(
+                Q(json_ext__pmt_class_household="NON_POOR")
+            )
 
         query = GroupGQLType.get_queryset(None, info)
-        # OPTIMIZATION: Phase 2 - Removed distinct() call for performance
-        # Original: query.filter(*filters).distinct()
-        # Reason: distinct() forces full table dedupe, causing query plan issues
-        # Testing shows Prefetch handles relationships without needing distinct()
-        # If duplicates appear in results, re-add: .distinct()
         query = query.filter(*filters)
 
         from django.db.models import Prefetch
@@ -644,34 +680,20 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
                 Q(mutations__mutation__client_mutation_id=client_mutation_id)
             )
 
-        # ---- Consent filtering (optimized with Subquery to avoid group__groupindividuals__ traversal) ----
-        # Instead of: GROUP_IND → GROUP → GROUP_IND (HEAD) → INDIVIDUAL (slow, multiple JOINs)
-        # We do: Find groups first, then filter simple group_id (fast, simple)
         is_non_consented = kwargs.get("isNonConsented", None)
         if is_non_consented is not None:
-            from django.db.models import Subquery
-
+            marker_q = non_consented_marker_q("groupindividuals__individual__json_ext")
             if is_non_consented is True:
-                # Find all groups that have non-consented HEAD individuals
                 non_consented_groups = Group.objects.filter(
                     groupindividuals__role=GroupIndividual.Role.HEAD,
-                    groupindividuals__individual__json_ext__consent_res__in=[2, "2"],
                     groupindividuals__is_deleted=False
-                ).values('pk').distinct()
-                # Filter GroupIndividuals to those groups (simple group_id check)
+                ).filter(marker_q).values('pk').distinct()
                 filters.append(Q(group_id__in=Subquery(non_consented_groups)))
             else:
-                # Find all groups that have consented HEAD individuals (positive filter)
                 consented_groups = Group.objects.filter(
                     groupindividuals__role=GroupIndividual.Role.HEAD,
                     groupindividuals__is_deleted=False
-                ).filter(
-                    Q(groupindividuals__individual__json_ext__contains={"is_non_consented": False})
-                    | Q(groupindividuals__individual__json_ext__contains={"isNonConsented": False})
-                    | Q(groupindividuals__individual__json_ext__consent_res__in=[1])
-                    | Q(groupindividuals__individual__json_ext__consent_res__isnull=True)
-                ).values('pk').distinct()
-                # Filter GroupIndividuals to those groups (simple group_id check)
+                ).exclude(marker_q).values('pk').distinct()
                 filters.append(Q(group_id__in=Subquery(consented_groups)))
 
         query = GroupIndividual.objects.filter(*filters)
@@ -779,40 +801,32 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         from individual.pmt_service import PmtService
         from location.models import Location
         import uuid as uuid_lib
+        import logging
 
         Query._check_permissions(info.context.user, IndividualConfig.gql_pmt_rerun_perms)
 
-        # Convert location UUIDs to codes if provided
-        # Searcher component sends location UUIDs, but service expects location codes
-        import logging
         logger = logging.getLogger(__name__)
 
         def uuid_to_code(location_uuid, param_name='district_code'):
-            """Convert location UUID to location code"""
             if not location_uuid:
                 return location_uuid
 
             try:
-                # Validate it's a UUID format
                 uuid_lib.UUID(location_uuid)
             except (ValueError, TypeError):
-                # Not a UUID, assume it's already a code
                 logger.info(f"[PMT] {param_name} is not a UUID, treating as code: {location_uuid}")
                 return location_uuid
 
             logger.info(f"[PMT] Converting {param_name} UUID to code: {location_uuid}")
 
-            # Try to find location by UUID in various ways
             location = None
 
-            # Try 1: Direct id lookup (if id is UUID)
             try:
                 location = Location.objects.get(id=location_uuid)
                 logger.info(f"[PMT] Found location by id: {location.code}")
             except (Location.DoesNotExist, ValueError):
                 pass
 
-            # Try 2: UUID field lookup
             if not location:
                 try:
                     location = Location.objects.get(uuid=location_uuid)
@@ -820,7 +834,6 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
                 except (Location.DoesNotExist, ValueError, AttributeError):
                     pass
 
-            # Try 3: String matching in id or uuid fields
             if not location:
                 try:
                     location = Location.objects.filter(
@@ -840,7 +853,6 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
                 logger.warning(f"[PMT] Could not find location for UUID: {location_uuid}, keeping original")
                 return location_uuid
 
-        # Convert UUIDs to codes
         if district_code:
             original = district_code
             district_code = uuid_to_code(district_code, 'district_code')
@@ -988,8 +1000,8 @@ class Mutation(graphene.ObjectType):
 
 class IndividualFilterSet(django_filters.FilterSet):
     """
-    Filters Individuals by consent flag stored in Individual.Json_ext.
-    DB path: json_ext__consent_res
+    Filters Individuals by consent flag stored in Individual.json_ext.
+    Supports both flat json_ext.consent_res and nested json_ext.json_ext.consent_res.
     """
     is_non_consented = django_filters.BooleanFilter(method="filter_is_non_consented")
 
@@ -997,7 +1009,7 @@ class IndividualFilterSet(django_filters.FilterSet):
         if value is None:
             return queryset
 
-        non_consented_q = Q(json_ext__consent_res=2) | Q(json_ext__consent_res="2")
+        non_consented_q = non_consented_marker_q()
         if value is True:
             return queryset.filter(non_consented_q)
         return queryset.exclude(non_consented_q)

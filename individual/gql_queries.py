@@ -1,6 +1,7 @@
 import graphene
 import django_filters
 from django.db.models import Q
+from django.db.models.fields.json import KeyTextTransform
 from django.contrib.auth.models import AnonymousUser
 from graphene_django import DjangoObjectType
 import graphene_django_optimizer as gql_optimizer
@@ -20,6 +21,49 @@ def _have_permissions(user, permission):
     return user.has_perms(permission)
 
 
+def _json_ext_payload(ext):
+    """
+    API ETL imports can store the Survey Solutions payload either directly in
+    json_ext or under json_ext["json_ext"]. Keep GraphQL resolvers compatible
+    with both shapes.
+    """
+    ext = ext or {}
+    nested = ext.get("json_ext") or ext.get("jsonExt")
+
+    if isinstance(nested, dict):
+        return nested
+
+    return ext
+
+
+def _json_ext_raw(ext):
+    payload = _json_ext_payload(ext)
+    raw = payload.get("raw") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def non_consented_marker_q(individual_json_path="json_ext"):
+    """
+    Match non-interviewed / non-consented households by consent result only.
+
+    Keep this deliberately narrow: this filter is used by the Uninterviewed
+    listing and runs on large tables. Do not add raw questionnaire fields here.
+    """
+    return (
+        Q(**{f"{individual_json_path}__consent_res": "2"})
+        | Q(**{f"{individual_json_path}__consent_res": "02"})
+    )
+
+
+def apply_non_consented_filter(queryset, value=True):
+    queryset = queryset.annotate(
+        consent_res_text=KeyTextTransform("consent_res", "json_ext")
+    )
+    if value is True:
+        return queryset.filter(consent_res_text__in=["2", "02"])
+    return queryset.exclude(consent_res_text__in=["2", "02"])
+
+
 class JsonExtMixin:
     def resolve_json_ext(self, info):
         if _have_permissions(info.context.user, IndividualConfig.gql_individual_search_perms):
@@ -29,7 +73,7 @@ class JsonExtMixin:
 
 class IndividualFilterSet(django_filters.FilterSet):
     """
-    Adds GraphQL filter: isNonConsented (camelCase) 
+    Adds GraphQL filter: isNonConsented (camelCase)
 
     IMPORTANT:
     - This is ETL-safe: no DB migration required.
@@ -44,28 +88,16 @@ class IndividualFilterSet(django_filters.FilterSet):
         if value is None:
             return queryset
 
-        # Supported marker patterns (top-level + raw)
-        marker_q = (
-            # Preferred explicit marker (future-proof if ETL sets it later)
-            Q(json_ext__contains={"is_non_consented": True})
-            | Q(json_ext__contains={"isNonConsented": True})
-
-            # real storage: json_ext.consent_res (flat structure)
-            | Q(json_ext__consent_res=2)
-            | Q(json_ext__consent_res="2")
-        )
-
-
-
         if value is True:
-            return queryset.filter(marker_q)
+            return apply_non_consented_filter(queryset, True)
 
         # value is False => exclude those marked as non-consented
-        return queryset.exclude(marker_q)
+        return apply_non_consented_filter(queryset, False)
 
     class Meta:
         model = Individual
         fields = []
+
 
 class IndividualGQLType(DjangoObjectType):
     uuid = graphene.String(source="uuid")
@@ -73,6 +105,7 @@ class IndividualGQLType(DjangoObjectType):
     # GraphQL camelCase fields for UI
     tf4_no = graphene.String(name="tf4No")
     interview_key = graphene.String(name="interviewKey")
+    interview_results_no = graphene.String(name="interviewResultsNo")
 
     class Meta:
         model = Individual
@@ -100,7 +133,7 @@ class IndividualGQLType(DjangoObjectType):
             return None
 
         ext = getattr(self, "json_ext", None) or {}
-        raw = ext.get("raw") or {}  # Flat structure: raw is at top level of json_ext
+        raw = _json_ext_raw(ext)
 
         v = raw.get("TF4_NO") or raw.get("tf4_no")
         return str(v) if v is not None else None
@@ -114,12 +147,16 @@ class IndividualGQLType(DjangoObjectType):
             return None
 
         ext = getattr(self, "json_ext", None) or {}
-        raw = ext.get("raw") or {}  # Flat structure
+        payload = _json_ext_payload(ext)
+        raw = _json_ext_raw(ext)
 
         v = (
             ext.get("external_id")
             or ext.get("interview_key")
             or ext.get("interviewKey")
+            or payload.get("external_id")
+            or payload.get("interview_key")
+            or payload.get("interviewKey")
             or raw.get("external_id")
             or raw.get("interview_key")
             or raw.get("interviewKey")
@@ -127,10 +164,36 @@ class IndividualGQLType(DjangoObjectType):
 
         return str(v) if v is not None else None
 
+    def resolve_interview_results_no(self, info):
+        if not _have_permissions(info.context.user, IndividualConfig.gql_individual_search_perms):
+            return None
+
+        ext = getattr(self, "json_ext", None) or {}
+        payload = _json_ext_payload(ext)
+        raw = _json_ext_raw(ext)
+
+        v = (
+            raw.get("interview_resultsNo")
+            or raw.get("interview_results_no")
+            or raw.get("interview_results")
+            or raw.get("INTERVIEW_RESULTSNO")
+            or raw.get("INTERVIEW_RESULTS_NO")
+            or raw.get("INTERVIEW_RESULTS")
+            or payload.get("interview_resultsNo")
+            or payload.get("interview_results_no")
+            or payload.get("interview_results")
+            or ext.get("interview_resultsNo")
+            or ext.get("interview_results_no")
+            or ext.get("interview_results")
+        )
+
+        return str(v).strip().zfill(2) if v not in (None, "") else None
+
 
     @classmethod
     def get_queryset(cls, queryset, info):
         return Individual.get_queryset(queryset, info.context.user)
+
 
 class IndividualHistoryGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
@@ -203,37 +266,35 @@ class IndividualDataSourceGQLType(DjangoObjectType):
 class GroupGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
     head = graphene.Field(IndividualGQLType)
+    pmt_score_household = graphene.Float(name="pmtScoreHousehold")
+    pmt_class_household = graphene.String(name="pmtClassHousehold")
 
     def resolve_head(self, info):
         """
-        Resolve the head individual of this group.
-        Applies consent filtering for consistency with resolve_group().
+        IMPORTANT:
+        Do not enforce consent business rules here.
+        - resolve_group(...) decides which groups appear on the normal Group page
+        - the Non-Consented page uses its own dedicated fetch/query path
+        - this resolver should only return the HEAD for groups already returned
         """
-        # Get the isNonConsented parameter from parent query context
-        is_non_consented = False
-        try:
-            if hasattr(info, 'variable_values') and info.variable_values:
-                is_non_consented = info.variable_values.get("isNonConsented", False)
-        except Exception:
-            pass
-
-        queryset = Individual.objects.filter(
+        return Individual.objects.filter(
             groupindividuals__group__id=self.id,
             groupindividuals__role=GroupIndividual.Role.HEAD,
             groupindividuals__is_deleted=False,
-        )
+        ).first()
 
-        # Apply consent filtering (exclude non-consented by default)
-        if not is_non_consented:
-            non_consented_q = (
-                Q(json_ext__consent_res=2) | Q(json_ext__consent_res="2")
-            )
-            queryset = queryset.exclude(non_consented_q)
+    def resolve_pmt_score_household(self, info):
+        ext = getattr(self, "json_ext", None) or {}
+        value = ext.get("pmt_score_household")
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
 
-        # Performance optimization
-        queryset = queryset.select_related('location')
-
-        return queryset.first()
+    def resolve_pmt_class_household(self, info):
+        ext = getattr(self, "json_ext", None) or {}
+        value = ext.get("pmt_class_household")
+        return str(value) if value is not None else None
 
     class Meta:
         model = Group
@@ -261,34 +322,14 @@ class GroupHistoryGQLType(DjangoObjectType):
 
     def resolve_head(self, info):
         """
-        Resolve the head individual of this group (historical version).
-        Applies consent filtering for consistency with resolve_group().
+        Keep history head resolution simple for the same reason as GroupGQLType:
+        do not apply page-level business filters here.
         """
-        # Get the isNonConsented parameter from parent query context
-        is_non_consented = False
-        try:
-            if hasattr(info, 'variable_values') and info.variable_values:
-                is_non_consented = info.variable_values.get("isNonConsented", False)
-        except Exception:
-            pass
-
-        queryset = Individual.objects.filter(
+        return Individual.objects.filter(
             groupindividuals__group__id=self.id,
             groupindividuals__role=GroupIndividual.Role.HEAD,
             groupindividuals__is_deleted=False,
-        )
-
-        # Apply consent filtering (exclude non-consented by default)
-        if not is_non_consented:
-            non_consented_q = (
-                Q(json_ext__consent_res=2) | Q(json_ext__consent_res="2")
-            )
-            queryset = queryset.exclude(non_consented_q)
-
-        # Performance optimization
-        queryset = queryset.select_related('location')
-
-        return queryset.first()
+        ).first()
 
     def resolve_user_updated(self, info):
         return self.user_updated
@@ -600,4 +641,3 @@ class PmtRunProgressType(graphene.ObjectType):
     errors = graphene.List(graphene.String)
     started_at = graphene.DateTime()
     completed_at = graphene.DateTime()
-
