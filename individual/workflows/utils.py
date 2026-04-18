@@ -70,6 +70,8 @@ class BasePythonWorkflowExecutor(metaclass=ABCMeta):
                 # PMT fields (enriched later)
                 "pmt_score",
                 "pmt_class",
+                "consent_res",
+                "pssn_wave",
                 # Flat + convenience fields
                 "json_ext",
                 "gender",
