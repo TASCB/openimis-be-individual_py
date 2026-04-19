@@ -63,6 +63,7 @@ class BasePythonWorkflowExecutor(metaclass=ABCMeta):
                 # Household / grouping fields from adapter
                 "group_code",
                 "individual_role_code",
+                "member_ordinal",
                 "hhrep",
                 # Identifiers
                 "interview_key",
@@ -71,6 +72,7 @@ class BasePythonWorkflowExecutor(metaclass=ABCMeta):
                 "pmt_score",
                 "pmt_class",
                 "consent_res",
+                "record_type",
                 "pssn_wave",
                 # Flat + convenience fields
                 "json_ext",
