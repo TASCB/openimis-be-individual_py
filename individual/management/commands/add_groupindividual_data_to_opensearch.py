@@ -44,13 +44,10 @@ class Command(BaseCommand):
         # Loop through all GroupIndividual objects
         for idx, obj in enumerate(queryset, 1):
             try:
+                document = GroupIndividualDocument()
                 doc = GroupIndividualDocument(
                     meta={'id': obj.id},  # set document ID
-                    group={
-                        "id": obj.group.id,
-                        "code": obj.group.code,
-                        "json_ext": obj.group.json_ext,
-                    },
+                    group=document.prepare_group(obj),
                     individual={
                         "first_name": obj.individual.first_name,
                         "last_name": obj.individual.last_name,
@@ -58,7 +55,7 @@ class Command(BaseCommand):
                     },
                     role=obj.role,
                     recipient_type=obj.recipient_type,
-                    json_ext=obj.json_ext,
+                    json_ext={},
                 )
 
                 result = doc.save()  # save to OpenSearch

@@ -44,9 +44,7 @@ if 'opensearch_reports' in apps.app_configs:
             queryset_pagination = 5000
 
         def prepare_json_ext(self, instance):
-            json_ext_data = instance.json_ext
-            json_data = self.__flatten_dict(json_ext_data)
-            return json_data
+            return {}
 
         def __flatten_dict(self, d, parent_key='', sep='__'):
             items = {}
@@ -65,7 +63,19 @@ if 'opensearch_reports' in apps.app_configs:
         group = opensearch_fields.ObjectField(properties={
             'id': opensearch_fields.KeywordField(),
             'code': opensearch_fields.KeywordField(),
-            'json_ext': opensearch_fields.ObjectField(dynamic=False),
+            'location_code': opensearch_fields.KeywordField(),
+            'location_name': opensearch_fields.KeywordField(),
+            'head': opensearch_fields.KeywordField(),
+            'head_id': opensearch_fields.KeywordField(),
+            'primary_recipient': opensearch_fields.KeywordField(),
+            'primary_recipient_id': opensearch_fields.KeywordField(),
+            'secondary_recipient': opensearch_fields.KeywordField(),
+            'secondary_recipient_id': opensearch_fields.KeywordField(),
+            'pmt_score_household': opensearch_fields.FloatField(),
+            'pmt_class_household': opensearch_fields.KeywordField(),
+            'consent_res': opensearch_fields.KeywordField(),
+            'pssn_wave': opensearch_fields.KeywordField(),
+            'member_count': opensearch_fields.IntegerField(),
         })
         individual = opensearch_fields.ObjectField(properties={
             'first_name': opensearch_fields.KeywordField(),
@@ -99,6 +109,33 @@ if 'opensearch_reports' in apps.app_configs:
                 )
             elif isinstance(related_instance, Individual):
                 return GroupIndividual.objects.filter(individual=related_instance)
+
+        def prepare_group(self, instance):
+            group = instance.group
+            json_ext = group.json_ext or {}
+            members = json_ext.get('members') or {}
+            pmt_score = json_ext.get('pmt_score_household')
+            try:
+                pmt_score = float(pmt_score) if pmt_score not in (None, '') else None
+            except (TypeError, ValueError):
+                pmt_score = None
+            return {
+                'id': str(group.id),
+                'code': group.code,
+                'location_code': json_ext.get('location_code'),
+                'location_name': json_ext.get('location_name'),
+                'head': json_ext.get('head'),
+                'head_id': json_ext.get('head_id'),
+                'primary_recipient': json_ext.get('primary_recipient'),
+                'primary_recipient_id': json_ext.get('primary_recipient_id'),
+                'secondary_recipient': json_ext.get('secondary_recipient'),
+                'secondary_recipient_id': json_ext.get('secondary_recipient_id'),
+                'pmt_score_household': pmt_score,
+                'pmt_class_household': json_ext.get('pmt_class_household'),
+                'consent_res': json_ext.get('consent_res'),
+                'pssn_wave': json_ext.get('pssn_wave'),
+                'member_count': len(members) if isinstance(members, dict) else None,
+            }
 
         def prepare_json_ext(self, instance):
             json_ext_data = instance.json_ext
