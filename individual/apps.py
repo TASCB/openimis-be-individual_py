@@ -33,6 +33,7 @@ DEFAULT_CONFIG = {
     "validation_import_group_valid_items": "individual_validation.import_group_valid_items",
     "validation_upload_valid_items": "individual_validation.upload_valid_items",
     "validation_upload_valid_items_workflow": "individual-upload-valid-items.individual-upload-valid-items",
+    "deduplication_review_event": "individual_deduplication.resolve",
     "enable_python_workflows": True,
     "enable_maker_checker_logic_import": True,
     "enable_maker_checker_for_individual_upload": True,
@@ -83,6 +84,7 @@ class IndividualConfig(AppConfig):
 
     validation_upload_valid_items_workflow = None
     validation_upload_valid_items = None
+    deduplication_review_event = None
 
     enable_maker_checker_for_individual_upload = None
     enable_maker_checker_for_group_upload = None

@@ -1046,3 +1046,4 @@ class CreateDeduplicationIndividualReviewMutation(OpenIMISMutation):
         except Exception as e:
             logger.error(f"CreateDeduplicationIndividualReviewMutation: Unexpected error: {str(e)}", exc_info=True)
             return cls(ok=False, errors=[f"Mutation failed: {str(e)}"])
+

@@ -809,9 +809,60 @@ def _is_individual_model_column(column_name):
 class CreateDeduplicationIndividualReviewTasksService:
     """Service for creating deduplication review tasks for individuals."""
 
+    TASK_SOURCE = "CreateDeduplicationIndividualReviewTasksService"
+
     def __init__(self, user, validation_class=None):
         self.user = user
         self.validation_class = validation_class
+
+    @staticmethod
+    def _normalize_summary_item(item):
+        if isinstance(item, str):
+            item = json.loads(item)
+        elif hasattr(item, "items"):
+            item = dict(item)
+        else:
+            item = dict(item or {})
+
+        column_values = item.get("column_values", item.get("columnValues", {}))
+        if isinstance(column_values, str):
+            try:
+                column_values = json.loads(column_values)
+            except json.JSONDecodeError:
+                column_values = {}
+
+        return {
+            "count": item.get("count"),
+            "ids": [str(id_) for id_ in item.get("ids", [])],
+            "column_values": column_values or {},
+            "primary_id": item.get("primary_id") or item.get("primaryId"),
+        }
+
+    @staticmethod
+    def _serialize_individual_for_deduplication(individual):
+        json_ext = individual.json_ext or {}
+        return {
+            "uuid": str(individual.id),
+            "individual": {
+                "uuid": str(individual.id),
+                "first_name": individual.first_name,
+                "last_name": individual.last_name,
+                "dob": individual.dob.isoformat() if individual.dob else None,
+                "location": individual.location.name if individual.location else None,
+                "date_created": individual.date_created.isoformat() if individual.date_created else None,
+            },
+            "json_ext": json_ext,
+            "date_created": individual.date_created.isoformat() if individual.date_created else None,
+            "is_deleted": individual.is_deleted,
+        }
+
+    @staticmethod
+    def _headers_for_summary_item(item):
+        headers = ["individual", "first_name", "last_name", "dob", "location"]
+        for key in item.get("column_values", {}).keys():
+            if key not in headers:
+                headers.append(key)
+        return headers
 
     def create_individual_duplication_tasks(self, summary):
         """
@@ -829,31 +880,56 @@ class CreateDeduplicationIndividualReviewTasksService:
         try:
             task_service = TaskService(self.user)
 
-            # Flatten summary into task data
-            if not summary:
+            normalized_summary = [
+                self._normalize_summary_item(item)
+                for item in (summary or [])
+            ]
+            normalized_summary = [item for item in normalized_summary if item.get("ids")]
+
+            if not normalized_summary:
                 return output_result_success(detail="No duplicates to process")
 
-            # Extract all IDs from summary
-            all_ids = set()
-            for item in summary:
-                ids = item.get('ids', [])
-                if isinstance(ids, list):
-                    all_ids.update(ids)
+            created = []
+            for item in normalized_summary:
+                individuals = list(
+                    Individual.objects.filter(
+                        id__in=item["ids"],
+                        is_deleted=False,
+                    ).select_related("location").order_by("date_created", "id")
+                )
+                if len(individuals) < 2:
+                    continue
 
-            task_data = {
-                'source': self.__class__.__name__,
-                'executor_action_event': TasksManagementConfig.default_executor_event,
-                'business_data_serializer': f'{self.__class__.__module__}.{self.__class__.__name__}.create_individual_duplication_task_serializer',
-                'business_event': '',
-                'data': {
-                    'ids': list(all_ids),
-                    'column_values': summary[0].get('column_values', {}) if summary else {},
-                    'count': len(summary)
+                task_data = {
+                    'source': self.TASK_SOURCE,
+                    'status': Task.Status.RECEIVED,
+                    'executor_action_event': TasksManagementConfig.default_executor_event,
+                    'business_data_serializer': f'{self.__class__.__module__}.{self.__class__.__name__}.create_individual_duplication_task_serializer',
+                    'business_event': IndividualConfig.deduplication_review_event,
+                    'data': {
+                        'ids': [
+                            self._serialize_individual_for_deduplication(individual)
+                            for individual in individuals
+                        ],
+                        'primary_id': item.get("primary_id") or str(individuals[0].id),
+                        'column_values': item.get('column_values', {}),
+                        'count': len(individuals),
+                        'headers': self._headers_for_summary_item(item),
+                    }
                 }
-            }
+                result = task_service.create(task_data)
+                created.append(result)
 
-            result = task_service.create(task_data)
-            return result
+            if not created:
+                return output_result_success(detail="No duplicate tasks to create")
+
+            errors = []
+            for result in created:
+                if result and not result.get("success", False):
+                    errors.extend(result.get("errors", []))
+            if errors:
+                return {"success": False, "errors": errors}
+            return output_result_success(detail=f"{len(created)} deduplication task(s) created")
 
         except Exception as exc:
             return output_exception(
@@ -867,9 +943,13 @@ class CreateDeduplicationIndividualReviewTasksService:
         """Format task data for display in task management UI."""
         def serialize(key, value):
             if key == 'ids':
-                # Convert IDs to individual names
-                individuals = Individual.objects.filter(id__in=value)
-                return ', '.join([f"{i.first_name} {i.last_name}" for i in individuals])
+                names = []
+                for item in value:
+                    individual = item.get("individual", {}) if isinstance(item, dict) else {}
+                    names.append(
+                        f"{individual.get('first_name', '')} {individual.get('last_name', '')}".strip()
+                    )
+                return ', '.join([name for name in names if name])
             if key == 'column_values':
                 return json.dumps(value) if isinstance(value, dict) else str(value)
             return value
@@ -882,8 +962,33 @@ class CreateDeduplicationIndividualReviewTasksService:
         return cls.__name__
 
 
+def _parse_deduplication_resolve_data(resolve_data):
+    if isinstance(resolve_data, str):
+        try:
+            resolve_data = json.loads(resolve_data)
+        except json.JSONDecodeError:
+            resolve_data = json.loads(resolve_data.replace('\\"', '"'))
+
+    if not isinstance(resolve_data, dict):
+        return {}, []
+
+    values = resolve_data.get("values") or {}
+    selected_ids = resolve_data.get("beneficiaryIds") or resolve_data.get("individualIds") or []
+    return values, [str(id_) for id_ in selected_ids]
+
+
+def _extract_additional_resolve_data(task, task_payload=None):
+    task_payload = task_payload or {}
+    json_ext = getattr(task, "json_ext", None) or task_payload.get("json_ext") or {}
+    additional = json_ext.get("additional_resolve_data") or task_payload.get("additional_resolve_data")
+    if isinstance(additional, dict) and additional:
+        first = next(iter(additional.values()))
+        return first
+    return additional or {}
+
+
 @transaction.atomic
-def merge_duplicate_individuals(task_data, user):
+def merge_duplicate_individuals(task_data, user, resolve_data=None):
     """
     Merge duplicate individuals into the primary record.
 
@@ -897,39 +1002,75 @@ def merge_duplicate_individuals(task_data, user):
                    - 'ids': List of all duplicate individual IDs
         user: User performing the merge
     """
-    primary_id = task_data.get('primary_id')
-    duplicate_ids = task_data.get('ids', [])
+    values, selected_ids = _parse_deduplication_resolve_data(resolve_data or {})
+    task_ids = task_data.get('ids', [])
+    normalized_task_ids = []
+    for item in task_ids:
+        if isinstance(item, dict):
+            normalized_task_ids.append(str(item.get("uuid") or item.get("id")))
+        else:
+            normalized_task_ids.append(str(item))
 
+    selected_ids = selected_ids or normalized_task_ids
+    primary_id = task_data.get('primary_id')
+    duplicate_ids = selected_ids
+
+    if not primary_id:
+        primary_id = selected_ids[0] if selected_ids else None
     if not primary_id:
         logger.warning("No primary_id specified in deduplication task data")
         return
 
     try:
-        primary = Individual.objects.get(id=primary_id)
+        selected_individuals = list(
+            Individual.objects.select_for_update()
+            .filter(id__in=selected_ids, is_deleted=False)
+            .order_by("date_created", "id")
+        )
+        if len(selected_individuals) < 2:
+            logger.info("Deduplication task has fewer than two active selected individuals")
+            return
+
+        primary = next((i for i in selected_individuals if str(i.id) == str(primary_id)), selected_individuals[0])
+        primary_id = str(primary.id)
         duplicates = Individual.objects.filter(
             id__in=duplicate_ids
         ).exclude(id=primary_id)
 
+        for field, value in values.items():
+            if field in {"individual", "location", "date_created", "is_deleted"}:
+                continue
+            if hasattr(primary, field):
+                setattr(primary, field, value)
+            else:
+                primary.json_ext = primary.json_ext or {}
+                primary.json_ext[field] = value
+        primary.save(user=user)
+
         for duplicate in duplicates:
-            # Transfer GroupIndividual relationships
-            GroupIndividual.objects.filter(
+            group_individuals = GroupIndividual.objects.filter(
                 individual=duplicate,
                 is_deleted=False
-            ).update(individual=primary)
+            )
+            for group_individual in group_individuals:
+                group_individual.individual = primary
+                group_individual.save(user=user)
 
             # Transfer Beneficiary relationships if module installed
             try:
                 from social_protection.models import Beneficiary
-                Beneficiary.objects.filter(
+                beneficiaries = Beneficiary.objects.filter(
                     individual=duplicate,
                     is_deleted=False
-                ).update(individual=primary)
+                )
+                for beneficiary in beneficiaries:
+                    beneficiary.individual = primary
+                    beneficiary.save(user=user)
             except ImportError:
                 pass  # Module not installed
 
-            # Soft delete duplicate
-            duplicate.is_deleted = True
-            duplicate.save(user=user)
+            # Use the openIMIS HistoryModel delete path so audit and validity fields stay consistent.
+            duplicate.delete(user=user)
 
         logger.info(
             f"Successfully merged {len(duplicates)} duplicate individuals into {primary_id}"
@@ -942,6 +1083,14 @@ def merge_duplicate_individuals(task_data, user):
             "Error merging duplicate individuals",
             exc_info=True
         )
+
+
+def complete_deduplication_task(task, user, task_payload=None):
+    task_data = getattr(task, "data", None) or getattr(task, "business_data", None)
+    if not task_data:
+        task_data = (task_payload or {}).get("data") or (task_payload or {}).get("business_data") or {}
+    resolve_data = _extract_additional_resolve_data(task, task_payload)
+    merge_duplicate_individuals(task_data, user, resolve_data)
 
 
 class IndividualImportService:
