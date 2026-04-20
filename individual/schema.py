@@ -15,6 +15,7 @@ from core.gql.export_mixin import ExportableQueryMixin
 from core.schema import OrderedDjangoFilterConnectionField
 from core.services import wait_for_mutation
 from core.utils import append_validity_filter, is_valid_uuid
+from deduplication.gql_queries import DeduplicationSummaryGQLType, DeduplicationSummaryRowGQLType
 from individual.apps import IndividualConfig
 from individual.gql_mutations import (
     CreateIndividualMutation,
@@ -265,7 +266,7 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
     )
 
     individual_deduplication_summary = graphene.Field(
-        graphene.JSONString,
+        DeduplicationSummaryGQLType,
         columns=graphene.List(graphene.String, required=True),
         location_id=graphene.String(required=False),
     )
@@ -392,10 +393,16 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
             logger.debug(f"Dedup summary query - columns: {columns}, location_id: {location_id}")
 
             results = get_individual_duplication_aggregation(columns, location_id)
+            rows = [
+                DeduplicationSummaryRowGQLType(
+                    count=row.get("count"),
+                    ids=row.get("ids"),
+                    column_values=row.get("column_values", {}),
+                )
+                for row in results
+            ]
 
-            return json.dumps({
-                'rows': results
-            })
+            return DeduplicationSummaryGQLType(rows=rows)
         except Exception as e:
             logger.error(f"Error in resolve_individual_deduplication_summary: {str(e)}", exc_info=True)
             raise
@@ -626,16 +633,6 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         query = GroupGQLType.get_queryset(None, info)
         query = query.filter(*filters)
 
-        from django.db.models import Prefetch
-        query = query.select_related('location').prefetch_related(
-            Prefetch(
-                'groupindividuals',
-                queryset=GroupIndividual.objects.filter(
-                    is_deleted=False
-                ).select_related('individual', 'individual__location')
-            )
-        )
-
         custom_filters = kwargs.get("customFilters", None)
         if custom_filters:
             query = CustomFilterWizardStorage.build_custom_filters_queryset(
@@ -697,7 +694,6 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
                 filters.append(Q(group_id__in=Subquery(consented_groups)))
 
         query = GroupIndividual.objects.filter(*filters)
-        query = query.select_related('group', 'individual', 'individual__location')
         return gql_optimizer.query(query, info)
 
     def resolve_group_individual_history(self, info, **kwargs):
@@ -879,6 +875,7 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
             households.append({
                 'group_uuid': household.get('group_uuid'),
                 'group_code': household.get('group_code'),
+                'hh_rep': household.get('hh_rep'),
                 'head_uuid': household.get('head_uuid'),
                 'head_name': household.get('head_name'),
                 'pmt_score': household.get('pmt_score'),

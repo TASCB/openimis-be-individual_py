@@ -132,27 +132,50 @@ class PmtService(BaseService):
 
         # Paginate
         groups = list(queryset.order_by('-date_updated')[offset:offset + limit])
+        group_ids = [group.id for group in groups]
+        members_by_group = {}
+        heads_by_group = {}
+        hhrep_codes_by_group = {}
+
+        group_individuals = GroupIndividual.objects.filter(
+            group_id__in=group_ids,
+            is_deleted=False,
+            individual__is_deleted=False
+        ).select_related("individual")
+
+        for group_individual in group_individuals:
+            group_members = members_by_group.setdefault(group_individual.group_id, [])
+            group_members.append(group_individual.individual)
+
+            if (
+                group_individual.role == GroupIndividual.Role.HEAD and
+                group_individual.group_id not in heads_by_group
+            ):
+                heads_by_group[group_individual.group_id] = group_individual.individual
+
+            hhrep_code = str((group_individual.individual.json_ext or {}).get("hhrep") or "").strip()
+            if hhrep_code and group_individual.group_id not in hhrep_codes_by_group:
+                hhrep_codes_by_group[group_individual.group_id] = hhrep_code
 
         # Build result with household data
         households = []
         for group in groups:
-            # Get HEAD individual
-            head = Individual.objects.filter(
-                groupindividuals__group=group,
-                groupindividuals__role=GroupIndividual.Role.HEAD,
-                groupindividuals__is_deleted=False,
-                is_deleted=False
-            ).first()
-
-            # Get member count
-            member_count = GroupIndividual.objects.filter(
-                group=group,
-                is_deleted=False
-            ).count()
+            members = members_by_group.get(group.id, [])
+            head = heads_by_group.get(group.id)
+            hhrep_code = hhrep_codes_by_group.get(group.id)
+            representative = next(
+                (
+                    member for member in members
+                    if str((member.json_ext or {}).get("individual_role_code") or "").strip() == hhrep_code
+                ),
+                None
+            ) if hhrep_code else None
+            member_count = len(members)
 
             household_data = {
                 "group_uuid": str(group.uuid),
                 "group_code": group.code,
+                "hh_rep": f"{representative.first_name} {representative.last_name}" if representative else None,
                 "head_uuid": str(head.uuid) if head else None,
                 "head_name": f"{head.first_name} {head.last_name}" if head else None,
                 "pmt_score": group.json_ext.get("pmt_score_household"),

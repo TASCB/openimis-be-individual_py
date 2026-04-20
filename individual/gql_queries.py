@@ -605,6 +605,7 @@ class PmtHouseholdEnrollmentType(graphene.ObjectType):
     """Household enrollment data for PMT enrollment list view."""
     group_uuid = graphene.String()
     group_code = graphene.String()
+    hh_rep = graphene.String()
     head_uuid = graphene.String()
     head_name = graphene.String()
     pmt_score = graphene.Float()

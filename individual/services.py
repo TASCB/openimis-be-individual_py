@@ -738,6 +738,9 @@ def get_individual_duplication_aggregation(columns, location_id=None):
     """
     from django.contrib.postgres.aggregates import ArrayAgg
 
+    raw_columns = columns
+    columns = _normalize_individual_deduplication_columns(columns)
+
     if not columns:
         return []
 
@@ -745,6 +748,11 @@ def get_individual_duplication_aggregation(columns, location_id=None):
     model_columns, json_columns = _resolve_individual_columns(columns)
 
     if not model_columns:
+        logger.warning(
+            "Individual deduplication scan has no valid model columns. raw_columns=%s normalized_columns=%s",
+            raw_columns,
+            columns,
+        )
         return []
 
     query = Individual.objects.filter(is_deleted=False)
@@ -772,10 +780,71 @@ def get_individual_duplication_aggregation(columns, location_id=None):
         results.append({
             'count': group['count'],
             'ids': [str(id_) for id_ in group['ids']],
-            'column_values': {col: group.get(col) for col in model_columns}
+            'column_values': {
+                col: _serialize_deduplication_column_value(group.get(col))
+                for col in model_columns
+            }
         })
 
+    logger.warning(
+        "Individual deduplication scan completed. raw_columns=%s normalized_columns=%s model_columns=%s result_count=%s",
+        raw_columns,
+        columns,
+        model_columns,
+        len(results),
+    )
     return results
+
+
+def _serialize_deduplication_column_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _normalize_individual_deduplication_columns(columns):
+    column_aliases = {
+        "firstName": "first_name",
+        "individual.firstName": "first_name",
+        "individual_firstName": "first_name",
+        "Individual First Name": "first_name",
+        "First Name": "first_name",
+        "firstname": "first_name",
+        "lastName": "last_name",
+        "individual.lastName": "last_name",
+        "individual_lastName": "last_name",
+        "Individual Last Name": "last_name",
+        "Last Name": "last_name",
+        "lastname": "last_name",
+        "dateOfBirth": "dob",
+        "birthDate": "dob",
+        "individual.dob": "dob",
+        "Date Of Birth": "dob",
+        "Date of Birth": "dob",
+        "Birth Date": "dob",
+    }
+
+    normalized_columns = []
+    for column in columns or []:
+        if not column:
+            continue
+        if isinstance(column, dict):
+            column = column.get("id") or column.get("name") or column.get("label")
+        column = str(column)
+        canonical_column = "".join(ch for ch in column.lower() if ch.isalnum())
+        if canonical_column in {"firstname", "individualfirstname"}:
+            column = "first_name"
+        elif canonical_column in {"lastname", "individuallastname"}:
+            column = "last_name"
+        elif canonical_column in {"dob", "dateofbirth", "birthdate", "individualdob"}:
+            column = "dob"
+        else:
+            column = column_aliases.get(column, column)
+        if column not in normalized_columns:
+            normalized_columns.append(column)
+    return normalized_columns
 
 
 def _resolve_individual_columns(columns):
@@ -1110,6 +1179,77 @@ class IndividualImportService:
     def __init__(self, user):
         super().__init__()
         self.user = user
+
+    @staticmethod
+    def _group_individual_role_from_label(role_label):
+        if not role_label:
+            return None
+        normalized_role = (
+            str(role_label)
+            .strip()
+            .upper()
+            .replace(" ", "_")
+            .replace("-", "_")
+        )
+        return getattr(GroupIndividual.Role, normalized_role, None)
+
+    @classmethod
+    def _group_individual_role_from_relationship(cls, relationship_to_head, gender):
+        relationship_code = str(relationship_to_head or "").strip()
+        normalized_gender = str(gender or "").strip().upper()
+
+        if not relationship_code:
+            return None
+        if relationship_code == "1":
+            return GroupIndividual.Role.HEAD
+        if relationship_code in ("2", "12"):
+            return GroupIndividual.Role.SPOUSE
+        if relationship_code in ("3", "4"):
+            if normalized_gender == "M":
+                return GroupIndividual.Role.SON
+            if normalized_gender == "F":
+                return GroupIndividual.Role.DAUGHTER
+            return GroupIndividual.Role.OTHER_RELATIVE
+        if relationship_code == "5":
+            if normalized_gender == "M":
+                return GroupIndividual.Role.BROTHER
+            if normalized_gender == "F":
+                return GroupIndividual.Role.SISTER
+            return GroupIndividual.Role.OTHER_RELATIVE
+        if relationship_code == "6":
+            if normalized_gender == "M":
+                return GroupIndividual.Role.GRANDSON
+            if normalized_gender == "F":
+                return GroupIndividual.Role.GRANDDAUGHTER
+            return GroupIndividual.Role.OTHER_RELATIVE
+        if relationship_code == "7":
+            if normalized_gender == "M":
+                return GroupIndividual.Role.FATHER
+            if normalized_gender == "F":
+                return GroupIndividual.Role.MOTHER
+            return GroupIndividual.Role.OTHER_RELATIVE
+        if relationship_code == "14":
+            return GroupIndividual.Role.NOT_RELATED
+        return GroupIndividual.Role.OTHER_RELATIVE
+
+    @classmethod
+    def _group_individual_role_from_json_ext(cls, json_ext):
+        json_ext = json_ext or {}
+        role_from_label = cls._group_individual_role_from_label(
+            json_ext.get("individual_role")
+        )
+        if role_from_label:
+            return role_from_label
+
+        relationship_to_head = (
+            json_ext.get("rel_to_hhh")
+            or json_ext.get("individual_role_code")
+            or json_ext.get("relationship_to_head")
+        )
+        return cls._group_individual_role_from_relationship(
+            relationship_to_head,
+            json_ext.get("gender"),
+        )
 
     @register_service_signal("individual.import_individuals")
     def import_individuals(
@@ -1617,16 +1757,18 @@ class IndividualImportService:
                     created_groups += 1
                 touched_groups.add(grp.id)
 
-                # Role / recipient inference from individual's json_ext
+                # Role / recipient inference from individual's json_ext.
+                # Keep this aligned with api_etl's relationship-to-head mapping.
                 jx = ind.json_ext or {}
                 role_code = str(
                     jx.get("individual_role_code")
+                    or jx.get("rel_to_hhh")
                     or jx.get("relationship_to_head")
                     or ""
                 ).strip()
                 hhrep_code = str(jx.get("hhrep") or "").strip()
 
-                desired_role = GroupIndividual.Role.HEAD if role_code == "1" else None
+                desired_role = self._group_individual_role_from_json_ext(jx)
                 desired_recipient = (
                     GroupIndividual.RecipientType.PRIMARY
                     if (hhrep_code and hhrep_code == role_code)
