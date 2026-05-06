@@ -111,6 +111,7 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         customFilters=graphene.List(of_type=graphene.String),
         benefitPlanToEnroll=graphene.String(),
         benefitPlanId=graphene.String(),
+        isTasafBeneficiary=graphene.Boolean(),
         filterNotAttachedToGroup=graphene.Boolean(),
         parent_location=graphene.String(),
         parent_location_level=graphene.Int(),
@@ -304,6 +305,12 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
             filters.append(
                 Q(is_deleted=False) & Q(beneficiary__benefit_plan_id=benefit_plan_id)
             )
+
+        is_tasaf_beneficiary = kwargs.get("isTasafBeneficiary")
+        if is_tasaf_beneficiary is True:
+            filters.append(Q(is_deleted=False) & Q(beneficiary__benefit_plan_id__isnull=False))
+        elif is_tasaf_beneficiary is False:
+            filters.append(Q(is_deleted=False) & Q(beneficiary__benefit_plan_id__isnull=True))
 
         filter_not_attached_to_group = kwargs.get("filterNotAttachedToGroup")
         if filter_not_attached_to_group:

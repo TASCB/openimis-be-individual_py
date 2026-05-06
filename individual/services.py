@@ -612,14 +612,20 @@ class GroupAndGroupIndividualAlignmentService:
         try:
             p_score = None
             p_class = None
+            p_cutoff = None
             if isinstance(head_json_ext, dict):
                 p_score = head_json_ext.get("pmt_score")
                 p_class = head_json_ext.get("pmt_class")
-            if (group.json_ext.get("pmt_score_household") != p_score) or (
-                group.json_ext.get("pmt_class_household") != p_class
+                p_cutoff = head_json_ext.get("pmt_cutoff_used")
+            if (
+                (group.json_ext.get("pmt_score_household") != p_score)
+                or (group.json_ext.get("pmt_class_household") != p_class)
+                or (group.json_ext.get("pmt_cutoff_used") != p_cutoff)
             ):
                 group.json_ext["pmt_score_household"] = p_score
                 group.json_ext["pmt_class_household"] = p_class
+                if p_cutoff is not None:
+                    group.json_ext["pmt_cutoff_used"] = p_cutoff
         except Exception:
             logger.debug("PMT mirror to group json_ext failed", exc_info=True)
 
@@ -1820,7 +1826,8 @@ class IndividualImportService:
                     if desired_role == GroupIndividual.Role.HEAD:
                         pmt_score = jx.get("pmt_score")
                         pmt_class = jx.get("pmt_class")
-                        if pmt_score is not None or pmt_class is not None:
+                        pmt_cutoff_used = jx.get("pmt_cutoff_used")
+                        if pmt_score is not None or pmt_class is not None or pmt_cutoff_used is not None:
                             upd = False
                             if grp.json_ext is None:
                                 grp.json_ext = {}
@@ -1835,6 +1842,12 @@ class IndividualImportService:
                                 and grp.json_ext.get("pmt_class_household") != pmt_class
                             ):
                                 grp.json_ext["pmt_class_household"] = pmt_class
+                                upd = True
+                            if (
+                                pmt_cutoff_used is not None
+                                and grp.json_ext.get("pmt_cutoff_used") != pmt_cutoff_used
+                            ):
+                                grp.json_ext["pmt_cutoff_used"] = pmt_cutoff_used
                                 upd = True
                             if upd:
                                 grp.save(update_fields=["json_ext"], user=self.user)

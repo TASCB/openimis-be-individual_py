@@ -140,8 +140,9 @@ class IndividualGQLType(DjangoObjectType):
 
     def resolve_interview_key(self, info):
         """
-        You said: external_id = interview_key (configured in module config)
-        So UI "interviewKey" should show external_id (e.g. 33-16-67-10)
+        Prefer the explicit interview key fields first.
+        Some datasets also carry external_id, but that can be a different
+        identifier (for example P3-based codes) and should be a fallback only.
         """
         if not _have_permissions(info.context.user, IndividualConfig.gql_individual_search_perms):
             return None
@@ -151,15 +152,21 @@ class IndividualGQLType(DjangoObjectType):
         raw = _json_ext_raw(ext)
 
         v = (
-            ext.get("external_id")
-            or ext.get("interview_key")
+            ext.get("interview_key")
             or ext.get("interviewKey")
-            or payload.get("external_id")
+            or ext.get("INTERVIEW_KEY")
             or payload.get("interview_key")
             or payload.get("interviewKey")
-            or raw.get("external_id")
+            or payload.get("INTERVIEW_KEY")
             or raw.get("interview_key")
             or raw.get("interviewKey")
+            or raw.get("INTERVIEW_KEY")
+            or ext.get("external_id")
+            or ext.get("externalId")
+            or payload.get("external_id")
+            or payload.get("externalId")
+            or raw.get("external_id")
+            or raw.get("externalId")
         )
 
         return str(v) if v is not None else None

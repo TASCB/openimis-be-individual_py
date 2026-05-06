@@ -17,7 +17,8 @@ import time
 from datetime import datetime
 from django.core.exceptions import ValidationError
 from django.db import transaction, IntegrityError
-from django.db.models import Count, Q, Max
+from django.db.models import Case, CharField, Count, F, IntegerField, Max, OuterRef, Q, Subquery, Value, When
+from django.db.models.fields.json import KeyTextTransform
 from django.utils import timezone
 
 from core.services import BaseService
@@ -195,6 +196,57 @@ class PmtService(BaseService):
             "limit": limit,
         }
 
+    def _base_groups_with_pmt(self, district_code=None, region_code=None):
+        queryset = Group.get_queryset(
+            Group.objects.filter(
+                is_deleted=False,
+                json_ext__pmt_class_household__isnull=False,
+            ),
+            self.user,
+        )
+
+        if district_code:
+            queryset = queryset.filter(
+                Q(location__code=district_code)
+                | Q(location__parent__code=district_code)
+                | Q(location__parent__parent__code=district_code)
+            )
+        elif region_code:
+            queryset = queryset.filter(
+                Q(location__code=region_code)
+                | Q(location__parent__code=region_code)
+                | Q(location__parent__parent__code=region_code)
+                | Q(location__parent__parent__parent__code=region_code)
+            )
+
+        return queryset
+
+    @staticmethod
+    def _annotate_district_fields(queryset):
+        return queryset.annotate(
+            district_id=Case(
+                When(location__type='D', then=F('location_id')),
+                When(location__parent__type='D', then=F('location__parent_id')),
+                When(location__parent__parent__type='D', then=F('location__parent__parent_id')),
+                default=Value(None),
+                output_field=IntegerField(),
+            ),
+            district_code=Case(
+                When(location__type='D', then=F('location__code')),
+                When(location__parent__type='D', then=F('location__parent__code')),
+                When(location__parent__parent__type='D', then=F('location__parent__parent__code')),
+                default=Value(None),
+                output_field=CharField(),
+            ),
+            district_name=Case(
+                When(location__type='D', then=F('location__name')),
+                When(location__parent__type='D', then=F('location__parent__name')),
+                When(location__parent__parent__type='D', then=F('location__parent__parent__name')),
+                default=Value(None),
+                output_field=CharField(),
+            ),
+        )
+
     # ================================
     # - Keep pagination + return shape unchanged
     # ================================
@@ -217,240 +269,51 @@ class PmtService(BaseService):
             dict with districts list (sorted by recency), pagination info, and total count
         """
         try:
-            from location.models import Location
+            base_queryset = self._annotate_district_fields(
+                self._base_groups_with_pmt(district_code=district_code, region_code=region_code)
+            ).exclude(district_id__isnull=True)
 
-            # CASE 1: Specific district requested
-            if district_code:
-                try:
-                    district = Location.objects.filter(
-                        code=district_code,
-                        type='D',
-                        validity_to__isnull=True
-                    ).first()
-
-                    if not district:
-                        return {
-                            "districts": [],
-                            "total_count": 0,
-                            "has_next": False,
-                            "has_previous": False,
-                            "offset": offset,
-                            "limit": limit,
-                        }
-
-                    # Get groups in this district + child locations that have PMT data
-                    groups_qs = Group.get_queryset(
-                        Group.objects.filter(
-                            Q(location=district) |  # Level 1: Direct district level
-                            Q(location__parent=district) |  # Level 2: Wards
-                            Q(location__parent__parent=district),  # Level 3: Villages
-                            is_deleted=False,
-                            json_ext__pmt_class_household__isnull=False  # KEY: Must have PMT data
-                        ),
-                        self.user,
-                    )
-
-                    counts = groups_qs.aggregate(
-                        poor_count=Count("id", filter=Q(json_ext__pmt_class_household="POOR")),
-                        non_poor_count=Count("id", filter=Q(json_ext__pmt_class_household="NON_POOR")),
-                    )
-
-                    # Get latest cutoff used for this district
-                    latest_group = (
-                        groups_qs.exclude(json_ext__pmt_cutoff_used__isnull=True)
-                        .order_by("-date_updated")
-                        .only("json_ext", "date_updated")
-                        .first()
-                    )
-                    pmt_cutoff_used = None
-                    if latest_group and latest_group.json_ext:
-                        pmt_cutoff_used = latest_group.json_ext.get("pmt_cutoff_used")
-
-                    # Only return if district has PMT data
-                    if counts.get("poor_count", 0) or counts.get("non_poor_count", 0):
-                        district_data = {
-                            "district_code": district.code,
-                            "district_name": district.name,
-                            "pmt_cutoff": pmt_cutoff_used,
-                            "poor_count": counts.get("poor_count", 0) or 0,
-                            "non_poor_count": counts.get("non_poor_count", 0) or 0,
-                        }
-                        return {
-                            "districts": [district_data],
-                            "total_count": 1,
-                            "has_next": False,
-                            "has_previous": False,
-                            "offset": offset,
-                            "limit": limit,
-                        }
-                    else:
-                        # District has no PMT data yet
-                        return {
-                            "districts": [],
-                            "total_count": 0,
-                            "has_next": False,
-                            "has_previous": False,
-                            "offset": offset,
-                            "limit": limit,
-                        }
-
-                except Exception as e:
-                    logger.error(f"Error fetching district {district_code}: {str(e)}")
-                    return {
-                        "districts": [],
-                        "total_count": 0,
-                        "has_next": False,
-                        "has_previous": False,
-                        "offset": offset,
-                        "limit": limit,
-                    }
-
-            # CASE 2: Get all recently rerun districts (no specific district requested)
-            # Get all groups with PMT data
-            all_groups_with_pmt = Group.objects.filter(
-                is_deleted=False,
-                json_ext__pmt_class_household__isnull=False  # KEY: Must have PMT data
+            cutoff_subquery = (
+                self._annotate_district_fields(
+                    self._base_groups_with_pmt(district_code=district_code, region_code=region_code)
+                )
+                .filter(district_id=OuterRef("district_id"))
+                .exclude(json_ext__pmt_cutoff_used__isnull=True)
+                .annotate(pmt_cutoff_text=KeyTextTransform("pmt_cutoff_used", "json_ext"))
+                .order_by("-date_updated")
+                .values("pmt_cutoff_text")[:1]
             )
 
-            # Extract parent district code from each group's location
-            # Groups can be at 3 levels: district (D), ward (W), or village (V)
-            # We need to find the parent district for each group
-            from location.models import Location
-
-            # Get all distinct district locations from groups with PMT data
-            # First, collect all location IDs from groups with PMT data
-            group_location_ids = all_groups_with_pmt.values_list('location_id', flat=True).distinct()
-
-            # Get those locations and traverse to parent district
-            locations = Location.objects.filter(id__in=group_location_ids)
-            district_ids_with_pmt = set()
-
-            for location in locations:
-                # Find the district for this location
-                if location.type == 'D':
-                    # Direct district
-                    district_ids_with_pmt.add(location.id)
-                elif location.type == 'W':
-                    # Ward - parent is district
-                    if location.parent_id:
-                        district_ids_with_pmt.add(location.parent_id)
-                elif location.type == 'V':
-                    # Village - parent.parent is district
-                    if location.parent and location.parent.parent_id:
-                        district_ids_with_pmt.add(location.parent.parent_id)
-                # Handle other types - try traversing up
-                elif location.parent_id:
-                    # Try one level up
-                    parent = location.parent
-                    if parent and parent.type == 'D':
-                        district_ids_with_pmt.add(parent.id)
-                    elif parent and parent.parent_id and parent.parent.type == 'D':
-                        district_ids_with_pmt.add(parent.parent.id)
-
-            if not district_ids_with_pmt:
-                # No districts have been rerun yet
-                return {
-                    "districts": [],
-                    "total_count": 0,
-                    "has_next": False,
-                    "has_previous": False,
-                    "offset": offset,
-                    "limit": limit,
-                }
-
-            # Get districts with their latest update times
-            districts_with_dates = (
-                Group.objects
-                .filter(
-                    is_deleted=False,
-                    json_ext__pmt_class_household__isnull=False
-                )
-                .filter(
-                    Q(location_id__in=district_ids_with_pmt) |  # Direct district
-                    Q(location__parent_id__in=district_ids_with_pmt) |  # Ward level
-                    Q(location__parent__parent_id__in=district_ids_with_pmt)  # Village level
-                )
-                .values('location_id')
-                .annotate(latest_update=Max('date_updated'))
-                .order_by('-latest_update')
-            )
-
-            # Convert back to location objects to get district info
-            all_district_ids = [item['location_id'] for item in districts_with_dates]
-            all_locations = Location.objects.filter(id__in=all_district_ids)
-
-            district_map = {}  # Maps district_id to district location
-            for location in all_locations:
-                if location.type == 'D':
-                    district_map[location.id] = location
-                elif location.type == 'W' and location.parent:
-                    district_map[location.id] = location.parent
-                elif location.type == 'V' and location.parent and location.parent.parent:
-                    district_map[location.id] = location.parent.parent
-
-            # Build final list with latest updates per district
-            districts_by_id = {}
-            for item in districts_with_dates:
-                location_id = item['location_id']
-                district = district_map.get(location_id)
-                if district and district.id not in districts_by_id:
-                    districts_by_id[district.id] = {
-                        'location': district,
-                        'latest_update': item['latest_update']
-                    }
-
-            # Sort by latest_update
-            sorted_districts = sorted(
-                districts_by_id.values(),
-                key=lambda x: x['latest_update'],
-                reverse=True
-            )
-
-            total_count = len(sorted_districts)
-
-            # Apply pagination
-            paginated_districts = sorted_districts[offset:offset + limit]
-
-            districts_data = []
-            for item in paginated_districts:
-                district = item['location']
-                district_code = district.code
-                district_name = district.name
-
-                # Get counts for this district
-                groups_qs = Group.get_queryset(
-                    Group.objects.filter(
-                        Q(location_id=district.id) |  # Level 1: Direct district
-                        Q(location__parent_id=district.id) |  # Level 2: Wards
-                        Q(location__parent__parent_id=district.id),  # Level 3: Villages
-                        is_deleted=False,
-                        json_ext__pmt_class_household__isnull=False
-                    ),
-                    self.user,
-                )
-
-                counts = groups_qs.aggregate(
+            summary_queryset = (
+                base_queryset
+                .values("district_id", "district_code", "district_name")
+                .annotate(
+                    latest_update=Max("date_updated"),
                     poor_count=Count("id", filter=Q(json_ext__pmt_class_household="POOR")),
                     non_poor_count=Count("id", filter=Q(json_ext__pmt_class_household="NON_POOR")),
+                    pmt_cutoff_text=Subquery(cutoff_subquery),
                 )
+                .order_by("-latest_update")
+            )
 
-                # Get latest cutoff
-                latest_group = (
-                    groups_qs.exclude(json_ext__pmt_cutoff_used__isnull=True)
-                    .order_by("-date_updated")
-                    .only("json_ext", "date_updated")
-                    .first()
-                )
-                pmt_cutoff_used = None
-                if latest_group and latest_group.json_ext:
-                    pmt_cutoff_used = latest_group.json_ext.get("pmt_cutoff_used")
+            total_count = summary_queryset.count()
+            rows = list(summary_queryset[offset:offset + limit])
+
+            districts_data = []
+            for row in rows:
+                pmt_cutoff_used = row.get("pmt_cutoff_text")
+                if pmt_cutoff_used not in (None, ""):
+                    try:
+                        pmt_cutoff_used = float(pmt_cutoff_used)
+                    except (TypeError, ValueError):
+                        pass
 
                 districts_data.append({
-                    "district_code": district_code,
-                    "district_name": district_name,
+                    "district_code": row.get("district_code"),
+                    "district_name": row.get("district_name"),
                     "pmt_cutoff": pmt_cutoff_used,
-                    "poor_count": counts.get("poor_count", 0) or 0,
-                    "non_poor_count": counts.get("non_poor_count", 0) or 0,
+                    "poor_count": row.get("poor_count", 0) or 0,
+                    "non_poor_count": row.get("non_poor_count", 0) or 0,
                 })
 
             return {
