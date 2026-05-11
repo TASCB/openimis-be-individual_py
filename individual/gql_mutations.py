@@ -1035,10 +1035,18 @@ class CreateDeduplicationIndividualReviewMutation(OpenIMISMutation):
             service = CreateDeduplicationIndividualReviewTasksService(info.context.user)
             result = service.create_individual_duplication_tasks(summary)
 
-            return cls(
-                ok=result.get('success', False),
-                errors=result.get('errors', [])
-            )
+            if result.get('success', False):
+                return cls(ok=True, errors=[])
+
+            # output_exception()/output_result_success() put the reason in
+            # 'detail'/'message', not 'errors' - surface it so the UI shows
+            # something more useful than "Failed to create task".
+            errors = list(result.get('errors') or [])
+            detail = result.get('detail') or result.get('message')
+            if detail and str(detail) not in errors:
+                errors.append(str(detail))
+            logger.error("CreateDeduplicationIndividualReviewMutation failed: %s", result)
+            return cls(ok=False, errors=errors or ["Failed to create deduplication task"])
 
         except PermissionDenied as e:
             logger.warning(f"CreateDeduplicationIndividualReviewMutation: Permission denied: {str(e)}")

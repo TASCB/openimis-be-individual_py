@@ -830,6 +830,10 @@ def _normalize_individual_deduplication_columns(columns):
         "Date Of Birth": "dob",
         "Date of Birth": "dob",
         "Birth Date": "dob",
+        "location": "location__name",
+        "Location": "location__name",
+        "village": "location__name",
+        "Village": "location__name",
     }
 
     normalized_columns = []
@@ -846,6 +850,10 @@ def _normalize_individual_deduplication_columns(columns):
             column = "last_name"
         elif canonical_column in {"dob", "dateofbirth", "birthdate", "individualdob"}:
             column = "dob"
+        elif canonical_column in {"location", "locationname", "village", "villagename"}:
+            column = "location__name"
+        elif canonical_column in {"locationcode", "villagecode"}:
+            column = "location__code"
         else:
             column = column_aliases.get(column, column)
         if column not in normalized_columns:
@@ -873,9 +881,13 @@ def _resolve_individual_columns(columns):
 
 
 def _is_individual_model_column(column_name):
-    """Check if a column exists as a direct model field on Individual."""
+    """Check if a column maps to a model field on Individual.
+
+    Supports related lookups such as ``location__name`` / ``location__code``
+    by checking the first segment against the model fields.
+    """
     try:
-        Individual._meta.get_field(column_name)
+        Individual._meta.get_field(str(column_name).split("__", 1)[0])
         return True
     except Exception:
         return False
@@ -962,7 +974,7 @@ class CreateDeduplicationIndividualReviewTasksService:
             normalized_summary = [item for item in normalized_summary if item.get("ids")]
 
             if not normalized_summary:
-                return output_result_success(detail="No duplicates to process")
+                return output_result_success({"detail": "No duplicates to process"})
 
             created = []
             for item in normalized_summary:
@@ -996,7 +1008,7 @@ class CreateDeduplicationIndividualReviewTasksService:
                 created.append(result)
 
             if not created:
-                return output_result_success(detail="No duplicate tasks to create")
+                return output_result_success({"detail": "No duplicate tasks to create"})
 
             errors = []
             for result in created:
@@ -1004,7 +1016,7 @@ class CreateDeduplicationIndividualReviewTasksService:
                     errors.extend(result.get("errors", []))
             if errors:
                 return {"success": False, "errors": errors}
-            return output_result_success(detail=f"{len(created)} deduplication task(s) created")
+            return output_result_success({"detail": f"{len(created)} deduplication task(s) created"})
 
         except Exception as exc:
             return output_exception(
@@ -1015,22 +1027,21 @@ class CreateDeduplicationIndividualReviewTasksService:
 
     @staticmethod
     def create_individual_duplication_task_serializer(data):
-        """Format task data for display in task management UI."""
-        def serialize(key, value):
-            if key == 'ids':
-                names = []
-                for item in value:
-                    individual = item.get("individual", {}) if isinstance(item, dict) else {}
-                    names.append(
-                        f"{individual.get('first_name', '')} {individual.get('last_name', '')}".strip()
-                    )
-                return ', '.join([name for name in names if name])
-            if key == 'column_values':
-                return json.dumps(value) if isinstance(value, dict) else str(value)
-            return value
+        """Return the deduplication task business data for the Tasks UI.
 
-        serialized_data = crud_business_data_builder(data, serialize)
-        return serialized_data
+        ``data`` is already JSON-safe and already shaped the way the frontend
+        formatter (``IndividualDeduplicationTaskDisplay``) expects::
+
+            {"ids": [{"individual": {...}, "json_ext": {...}, "uuid": ...}, ...],
+             "headers": [...], "column_values": {...}, "count": N, "primary_id": ...}
+
+        Do NOT run it through ``crud_business_data_builder`` - that helper
+        assumes the CRUD-update shape ``{"incoming_data": {...}, "current_data": {...}}``
+        and raises ``AttributeError`` on the ``ids`` list, which makes
+        ``TaskGQLType.resolve_business_data`` return an error string and the task
+        renders blank.
+        """
+        return data
 
     @classmethod
     def get_class_name(cls):

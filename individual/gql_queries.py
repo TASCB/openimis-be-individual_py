@@ -120,6 +120,8 @@ class IndividualGQLType(DjangoObjectType):
             "is_deleted": ["exact"],
             "version": ["exact"],
             "location": ["isnull"],
+            "location__code": ["exact", "iexact", "istartswith", "icontains"],
+            "location__name": ["exact", "iexact", "istartswith", "icontains"],
         }
         connection_class = ExtendedConnection
 
@@ -314,6 +316,8 @@ class GroupGQLType(DjangoObjectType):
             "is_deleted": ["exact"],
             "version": ["exact"],
             "location": ["isnull"],
+            "location__code": ["exact", "iexact", "istartswith", "icontains"],
+            "location__name": ["exact", "iexact", "istartswith", "icontains"],
         }
         connection_class = ExtendedConnection
 
