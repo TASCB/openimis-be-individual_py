@@ -268,6 +268,20 @@ class PmtService(BaseService):
             dict with districts list (sorted by recency), pagination info, and total count
         """
         try:
+            from django.core.cache import cache
+
+            # (5) Short per-user TTL cache. The audit summary doesn't need to be
+            # live - reruns dispatch async via Celery and the next refresh after
+            # this TTL expires picks up new counts.
+            user_id = getattr(self.user, "id", None) or "anon"
+            cache_key = (
+                f"pmt_audit_summary:{user_id}:"
+                f"{district_code or ''}:{region_code or ''}:{offset}:{limit}"
+            )
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
+
             base_queryset = self._annotate_district_fields(
                 self._base_groups_with_pmt(district_code=district_code, region_code=region_code)
             ).exclude(district_id__isnull=True)
@@ -283,25 +297,31 @@ class PmtService(BaseService):
                 .order_by("-latest_update")
             )
 
-            total_count = summary_queryset.count()
+            # (4) Cheaper total: count distinct district_ids straight off the
+            # filtered base queryset instead of wrapping the full grouped
+            # aggregate in a subquery COUNT(*).
+            total_count = base_queryset.values("district_id").distinct().count()
             rows = list(summary_queryset[offset:offset + limit])
             district_ids = [row["district_id"] for row in rows if row.get("district_id") is not None]
 
             latest_cutoff_by_district = {}
             if district_ids:
+                # (3) Postgres DISTINCT ON (district_id) returns one row per
+                # district (the most recently updated one), instead of every
+                # group in the page's districts.
                 cutoff_rows = (
                     base_queryset
                     .filter(district_id__in=district_ids)
                     .exclude(json_ext__pmt_cutoff_used__isnull=True)
                     .annotate(pmt_cutoff_text=KeyTextTransform("pmt_cutoff_used", "json_ext"))
-                    .values("district_id", "pmt_cutoff_text")
                     .order_by("district_id", "-date_updated")
+                    .distinct("district_id")
+                    .values("district_id", "pmt_cutoff_text")
                 )
 
                 for cutoff_row in cutoff_rows:
-                    latest_cutoff_by_district.setdefault(
-                        cutoff_row["district_id"],
-                        cutoff_row["pmt_cutoff_text"],
+                    latest_cutoff_by_district[cutoff_row["district_id"]] = (
+                        cutoff_row["pmt_cutoff_text"]
                     )
 
             districts_data = []
@@ -321,7 +341,7 @@ class PmtService(BaseService):
                     "non_poor_count": row.get("non_poor_count", 0) or 0,
                 })
 
-            return {
+            result = {
                 "districts": districts_data,
                 "total_count": total_count,
                 "has_next": (offset + limit) < total_count,
@@ -329,6 +349,8 @@ class PmtService(BaseService):
                 "offset": offset,
                 "limit": limit,
             }
+            cache.set(cache_key, result, 60)
+            return result
 
         except Exception as e:
             logger.error(f"Error in get_pmt_audit_summary: {str(e)}", exc_info=True)
