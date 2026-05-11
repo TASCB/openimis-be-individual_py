@@ -609,30 +609,37 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
                 filters.append(head_q & ~marker_q)
 
         # ---- PMT household filters for Eligible Households page ----
+        pmt_filter_requested = False
+
         pmt_score_household_lte = kwargs.get("pmtScoreHousehold_Lte")
         if pmt_score_household_lte is not None:
+            pmt_filter_requested = True
             filters.append(
                 Q(json_ext__pmt_score_household__lte=pmt_score_household_lte)
             )
 
         pmt_score_household_lt = kwargs.get("pmtScoreHousehold_Lt")
         if pmt_score_household_lt is not None:
+            pmt_filter_requested = True
             filters.append(
                 Q(json_ext__pmt_score_household__lt=pmt_score_household_lt)
             )
 
         pmt_class_household = kwargs.get("pmtClassHousehold")
         if pmt_class_household:
+            pmt_filter_requested = True
             filters.append(
                 Q(json_ext__pmt_class_household=pmt_class_household)
             )
 
         pmt_eligible = kwargs.get("pmtEligible")
         if pmt_eligible is True:
+            pmt_filter_requested = True
             filters.append(
                 Q(json_ext__pmt_class_household="POOR")
             )
         elif pmt_eligible is False:
+            pmt_filter_requested = True
             filters.append(
                 Q(json_ext__pmt_class_household="NON_POOR")
             )
@@ -645,6 +652,15 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
             query = CustomFilterWizardStorage.build_custom_filters_queryset(
                 Query.module_name, "Group", custom_filters, query
             )
+
+        if pmt_filter_requested:
+            query = query.select_related(
+                "location",
+                "location__parent",
+                "location__parent__parent",
+                "location__parent__parent__parent",
+            )
+
         return gql_optimizer.query(query, info)
 
     def resolve_group_history(self, info, **kwargs):
@@ -822,32 +838,13 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
 
             logger.info(f"[PMT] Converting {param_name} UUID to code: {location_uuid}")
 
-            location = None
-
             try:
-                location = Location.objects.get(id=location_uuid)
-                logger.info(f"[PMT] Found location by id: {location.code}")
-            except (Location.DoesNotExist, ValueError):
-                pass
-
-            if not location:
-                try:
-                    location = Location.objects.get(uuid=location_uuid)
-                    logger.info(f"[PMT] Found location by uuid field: {location.code}")
-                except (Location.DoesNotExist, ValueError, AttributeError):
-                    pass
-
-            if not location:
-                try:
-                    location = Location.objects.filter(
-                        Q(id__iexact=location_uuid) |
-                        Q(uuid__iexact=location_uuid)
-                    ).first()
-                    if location:
-                        logger.info(f"[PMT] Found location by string match: {location.code}")
-                except Exception as e:
-                    logger.warning(f"[PMT] Error in string matching: {e}")
-                    pass
+                location = Location.objects.filter(
+                    Q(id=location_uuid) | Q(uuid=location_uuid)
+                ).only("code").first()
+            except Exception as e:
+                logger.warning(f"[PMT] Error resolving {param_name} UUID {location_uuid}: {e}")
+                location = None
 
             if location:
                 logger.info(f"[PMT] Successfully converted UUID {location_uuid[:8]}... to code: {location.code}")

@@ -17,7 +17,7 @@ import time
 from datetime import datetime
 from django.core.exceptions import ValidationError
 from django.db import transaction, IntegrityError
-from django.db.models import Case, CharField, Count, F, IntegerField, Max, OuterRef, Q, Subquery, Value, When
+from django.db.models import Case, CharField, Count, F, IntegerField, Max, Prefetch, Q, Value, When
 from django.db.models.fields.json import KeyTextTransform
 from django.utils import timezone
 
@@ -81,6 +81,25 @@ class PmtService(BaseService):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _apply_location_filter(queryset, district_code=None, region_code=None):
+        if district_code:
+            return queryset.filter(
+                Q(location__code=district_code)
+                | Q(location__parent__code=district_code)
+                | Q(location__parent__parent__code=district_code)
+            )
+
+        if region_code:
+            return queryset.filter(
+                Q(location__code=region_code)
+                | Q(location__parent__code=region_code)
+                | Q(location__parent__parent__code=region_code)
+                | Q(location__parent__parent__parent__code=region_code)
+            )
+
+        return queryset
+
     def get_households_with_pmt(self, district_code=None, region_code=None, offset=0, limit=10,
                                  search_text=None, pmt_class=None, pmt_cutoff=None):
         """
@@ -104,18 +123,11 @@ class PmtService(BaseService):
         # REQUIRED: Only include groups with PMT data
         queryset = queryset.filter(json_ext__pmt_class_household__isnull=False)
 
-        # Filter by location (district or region) - include child locations (wards, villages)
-        if district_code:
-            queryset = queryset.filter(
-                Q(location__code=district_code) |  # Level 1: Direct district level
-                Q(location__parent__code=district_code) |  # Level 2: Wards
-                Q(location__parent__parent__code=district_code)  # Level 3: Villages
-            )
-        elif region_code:
-            queryset = queryset.filter(
-                Q(location__code=region_code) |  # Level 1: Direct region level
-                Q(location__parent__code=region_code)  # Level 2: Child districts
-            )
+        queryset = self._apply_location_filter(
+            queryset,
+            district_code=district_code,
+            region_code=region_code,
+        )
 
         # Filter by PMT class if provided
         if pmt_class in ["POOR", "NON_POOR"]:
@@ -132,38 +144,36 @@ class PmtService(BaseService):
         total_count = queryset.count()
 
         # Paginate
-        groups = list(queryset.order_by('-date_updated')[offset:offset + limit])
-        group_ids = [group.id for group in groups]
-        members_by_group = {}
-        heads_by_group = {}
-        hhrep_codes_by_group = {}
-
-        group_individuals = GroupIndividual.objects.filter(
-            group_id__in=group_ids,
-            is_deleted=False,
-            individual__is_deleted=False
-        ).select_related("individual")
-
-        for group_individual in group_individuals:
-            group_members = members_by_group.setdefault(group_individual.group_id, [])
-            group_members.append(group_individual.individual)
-
-            if (
-                group_individual.role == GroupIndividual.Role.HEAD and
-                group_individual.group_id not in heads_by_group
-            ):
-                heads_by_group[group_individual.group_id] = group_individual.individual
-
-            hhrep_code = str((group_individual.individual.json_ext or {}).get("hhrep") or "").strip()
-            if hhrep_code and group_individual.group_id not in hhrep_codes_by_group:
-                hhrep_codes_by_group[group_individual.group_id] = hhrep_code
+        group_individuals_prefetch = Prefetch(
+            "groupindividuals",
+            queryset=GroupIndividual.objects.filter(
+                is_deleted=False,
+                individual__is_deleted=False,
+            ).select_related("individual"),
+        )
+        groups = list(
+            queryset.select_related("location")
+            .prefetch_related(group_individuals_prefetch)
+            .order_by('-date_updated')[offset:offset + limit]
+        )
 
         # Build result with household data
         households = []
         for group in groups:
-            members = members_by_group.get(group.id, [])
-            head = heads_by_group.get(group.id)
-            hhrep_code = hhrep_codes_by_group.get(group.id)
+            group_json_ext = group.json_ext or {}
+            members = []
+            head = None
+            hhrep_code = None
+            for group_individual in group.groupindividuals.all():
+                member = group_individual.individual
+                members.append(member)
+
+                if head is None and group_individual.role == GroupIndividual.Role.HEAD:
+                    head = member
+
+                if hhrep_code is None:
+                    hhrep_code = str((member.json_ext or {}).get("hhrep") or "").strip() or None
+
             representative = next(
                 (
                     member for member in members
@@ -179,8 +189,8 @@ class PmtService(BaseService):
                 "hh_rep": f"{representative.first_name} {representative.last_name}" if representative else None,
                 "head_uuid": str(head.uuid) if head else None,
                 "head_name": f"{head.first_name} {head.last_name}" if head else None,
-                "pmt_score": group.json_ext.get("pmt_score_household"),
-                "pmt_class": group.json_ext.get("pmt_class_household"),
+                "pmt_score": group_json_ext.get("pmt_score_household"),
+                "pmt_class": group_json_ext.get("pmt_class_household"),
                 "number_of_members": member_count,
                 "location_code": group.location.code if group.location else None,
                 "location_name": group.location.name if group.location else None,
@@ -204,22 +214,11 @@ class PmtService(BaseService):
             ),
             self.user,
         )
-
-        if district_code:
-            queryset = queryset.filter(
-                Q(location__code=district_code)
-                | Q(location__parent__code=district_code)
-                | Q(location__parent__parent__code=district_code)
-            )
-        elif region_code:
-            queryset = queryset.filter(
-                Q(location__code=region_code)
-                | Q(location__parent__code=region_code)
-                | Q(location__parent__parent__code=region_code)
-                | Q(location__parent__parent__parent__code=region_code)
-            )
-
-        return queryset
+        return self._apply_location_filter(
+            queryset,
+            district_code=district_code,
+            region_code=region_code,
+        )
 
     @staticmethod
     def _annotate_district_fields(queryset):
@@ -273,17 +272,6 @@ class PmtService(BaseService):
                 self._base_groups_with_pmt(district_code=district_code, region_code=region_code)
             ).exclude(district_id__isnull=True)
 
-            cutoff_subquery = (
-                self._annotate_district_fields(
-                    self._base_groups_with_pmt(district_code=district_code, region_code=region_code)
-                )
-                .filter(district_id=OuterRef("district_id"))
-                .exclude(json_ext__pmt_cutoff_used__isnull=True)
-                .annotate(pmt_cutoff_text=KeyTextTransform("pmt_cutoff_used", "json_ext"))
-                .order_by("-date_updated")
-                .values("pmt_cutoff_text")[:1]
-            )
-
             summary_queryset = (
                 base_queryset
                 .values("district_id", "district_code", "district_name")
@@ -291,17 +279,34 @@ class PmtService(BaseService):
                     latest_update=Max("date_updated"),
                     poor_count=Count("id", filter=Q(json_ext__pmt_class_household="POOR")),
                     non_poor_count=Count("id", filter=Q(json_ext__pmt_class_household="NON_POOR")),
-                    pmt_cutoff_text=Subquery(cutoff_subquery),
                 )
                 .order_by("-latest_update")
             )
 
             total_count = summary_queryset.count()
             rows = list(summary_queryset[offset:offset + limit])
+            district_ids = [row["district_id"] for row in rows if row.get("district_id") is not None]
+
+            latest_cutoff_by_district = {}
+            if district_ids:
+                cutoff_rows = (
+                    base_queryset
+                    .filter(district_id__in=district_ids)
+                    .exclude(json_ext__pmt_cutoff_used__isnull=True)
+                    .annotate(pmt_cutoff_text=KeyTextTransform("pmt_cutoff_used", "json_ext"))
+                    .values("district_id", "pmt_cutoff_text")
+                    .order_by("district_id", "-date_updated")
+                )
+
+                for cutoff_row in cutoff_rows:
+                    latest_cutoff_by_district.setdefault(
+                        cutoff_row["district_id"],
+                        cutoff_row["pmt_cutoff_text"],
+                    )
 
             districts_data = []
             for row in rows:
-                pmt_cutoff_used = row.get("pmt_cutoff_text")
+                pmt_cutoff_used = latest_cutoff_by_district.get(row.get("district_id"))
                 if pmt_cutoff_used not in (None, ""):
                     try:
                         pmt_cutoff_used = float(pmt_cutoff_used)
@@ -417,23 +422,30 @@ class PmtService(BaseService):
 
             # Fetch all groups (households) in district + child locations (wards, villages)
             # Searches 3 levels deep: district → ward → village
-            groups_query = Group.objects.filter(
-                is_deleted=False
-            ).filter(
-                Q(location__code=district_code) |  # Level 1: Groups at district level
-                Q(location__parent__code=district_code) |  # Level 2: Groups at ward level
-                Q(location__parent__parent__code=district_code)  # Level 3: Groups at village level
+            member_prefetch = Prefetch(
+                "groupindividuals",
+                queryset=GroupIndividual.objects.filter(
+                    is_deleted=False,
+                    individual__is_deleted=False,
+                ).select_related("individual"),
             )
+            groups_query = self._apply_location_filter(
+                Group.objects.filter(is_deleted=False),
+                district_code=district_code,
+                region_code=region_code,
+            ).prefetch_related(member_prefetch)
 
             groups = Group.get_queryset(groups_query, self.user)
 
             # Convert to list to count and iterate
             groups_list = list(groups)
             total_groups = len(groups_list)
+            total_individuals = sum(len(group.groupindividuals.all()) for group in groups_list)
 
             # Update progress: set total count and status to CALCULATING
             if progress:
                 progress.total_groups = total_groups
+                progress.total_individuals = total_individuals
                 progress.status = PmtRunProgress.Status.CALCULATING
                 progress.save()
 
@@ -443,26 +455,22 @@ class PmtService(BaseService):
 
             for idx, group in enumerate(groups_list):
                 try:
-                    # Get HEAD individual with household data
-                    head = Individual.objects.filter(
-                        groupindividuals__group=group,
-                        groupindividuals__role=GroupIndividual.Role.HEAD,
-                        groupindividuals__is_deleted=False,
-                        is_deleted=False
-                    ).first()
+                    group_individuals = list(group.groupindividuals.all())
+                    members = [group_individual.individual for group_individual in group_individuals]
+                    head = next(
+                        (
+                            group_individual.individual for group_individual in group_individuals
+                            if group_individual.role == GroupIndividual.Role.HEAD
+                        ),
+                        None,
+                    )
 
                     if not head:
                         continue
 
-                    # Get all household members for PMT calculation
-                    members = Individual.objects.filter(
-                        groupindividuals__group=group,
-                        groupindividuals__is_deleted=False,
-                        is_deleted=False
-                    )
-
                     # Prepare household data from HEAD's json_ext
                     head_json_ext = head.json_ext or {}
+                    head.json_ext = head_json_ext
                     raw_data = head_json_ext.get("raw") or {}
 
                     # Extract fields with validation
@@ -485,7 +493,7 @@ class PmtService(BaseService):
                         settlement = "rural"
 
                     hh_data = {
-                        "household_size": members.count(),
+                        "household_size": len(members),
                         "assets_owned": assets,
                         "settlement_type": settlement,
                     }
@@ -519,8 +527,10 @@ class PmtService(BaseService):
                     updated_individuals_count += 1
 
                     # Update all other household members with same PMT
-                    other_members = members.exclude(id=head.id)
-                    for member in other_members:
+                    for member in members:
+                        if member.id == head.id:
+                            continue
+                        member.json_ext = member.json_ext or {}
                         member.json_ext["pmt_score"] = new_pmt_score
                         if new_pmt_class:
                             member.json_ext["pmt_class"] = new_pmt_class
@@ -532,6 +542,7 @@ class PmtService(BaseService):
                         updated_individuals_count += 1
 
                     # Update group with household-level PMT (mirrors HEAD's PMT)
+                    group.json_ext = group.json_ext or {}
                     group.json_ext["pmt_score_household"] = new_pmt_score
                     if new_pmt_class:
                         group.json_ext["pmt_class_household"] = new_pmt_class
@@ -646,28 +657,29 @@ class PmtService(BaseService):
             logger.info(f"Starting auto-enrollment workflow for district {district_code}")
 
             # Find all groups with POOR classification (including child locations)
-            poor_groups = Group.objects.filter(
-                Q(location__code=district_code) |  # Level 1: Direct district level
-                Q(location__parent__code=district_code) |  # Level 2: Wards
-                Q(location__parent__parent__code=district_code),  # Level 3: Villages
-                is_deleted=False,
-                json_ext__pmt_class_household="POOR"
+            poor_groups = self._apply_location_filter(
+                Group.objects.filter(
+                    is_deleted=False,
+                    json_ext__pmt_class_household="POOR",
+                ),
+                district_code=district_code,
             )
 
             poor_groups_list = list(poor_groups)
             logger.info(f"Found {len(poor_groups_list)} POOR groups in district {district_code}")
 
+            existing_enrollment_group_ids = set(
+                PmtEnrollment.objects.filter(
+                    group_id__in=[group.id for group in poor_groups_list],
+                    is_deleted=False,
+                    status__in=[PmtEnrollment.Status.PENDING, PmtEnrollment.Status.ENROLLED],
+                ).values_list("group_id", flat=True)
+            )
+
             enrolled_count = 0
             for group in poor_groups_list:
                 try:
-                    # Check if enrollment already exists
-                    existing = PmtEnrollment.objects.filter(
-                        group=group,
-                        is_deleted=False,
-                        status__in=[PmtEnrollment.Status.PENDING, PmtEnrollment.Status.ENROLLED]
-                    ).first()
-
-                    if existing:
+                    if group.id in existing_enrollment_group_ids:
                         logger.debug(f"Group {group.code} already has active enrollment record")
                         continue
 

@@ -1199,6 +1199,30 @@ class IndividualImportService:
         )
         return getattr(GroupIndividual.Role, normalized_role, None)
 
+    @staticmethod
+    def _json_ext_lookup(json_ext, *keys):
+        """
+        Look up a value by key, walking top-level then nested
+        json_ext.json_ext and json_ext.json_ext.raw. Returns the first
+        non-empty match. Robust to importer payloads that nest the original
+        adapter dict (e.g. when role fields aren't promoted to CSV columns).
+        """
+        if not isinstance(json_ext, dict):
+            return None
+        candidates = [json_ext]
+        nested = json_ext.get("json_ext")
+        if isinstance(nested, dict):
+            candidates.append(nested)
+            raw = nested.get("raw")
+            if isinstance(raw, dict):
+                candidates.append(raw)
+        for source in candidates:
+            for key in keys:
+                value = source.get(key)
+                if value not in (None, ""):
+                    return value
+        return None
+
     @classmethod
     def _group_individual_role_from_relationship(cls, relationship_to_head, gender):
         relationship_code = str(relationship_to_head or "").strip()
@@ -1242,19 +1266,20 @@ class IndividualImportService:
     def _group_individual_role_from_json_ext(cls, json_ext):
         json_ext = json_ext or {}
         role_from_label = cls._group_individual_role_from_label(
-            json_ext.get("individual_role")
+            cls._json_ext_lookup(json_ext, "individual_role")
         )
         if role_from_label:
             return role_from_label
 
-        relationship_to_head = (
-            json_ext.get("rel_to_hhh")
-            or json_ext.get("individual_role_code")
-            or json_ext.get("relationship_to_head")
+        relationship_to_head = cls._json_ext_lookup(
+            json_ext,
+            "rel_to_hhh",
+            "individual_role_code",
+            "relationship_to_head",
         )
         return cls._group_individual_role_from_relationship(
             relationship_to_head,
-            json_ext.get("gender"),
+            cls._json_ext_lookup(json_ext, "gender"),
         )
 
     @register_service_signal("individual.import_individuals")
@@ -1767,12 +1792,15 @@ class IndividualImportService:
                 # Keep this aligned with api_etl's relationship-to-head mapping.
                 jx = ind.json_ext or {}
                 role_code = str(
-                    jx.get("individual_role_code")
-                    or jx.get("rel_to_hhh")
-                    or jx.get("relationship_to_head")
+                    self._json_ext_lookup(
+                        jx,
+                        "individual_role_code",
+                        "rel_to_hhh",
+                        "relationship_to_head",
+                    )
                     or ""
                 ).strip()
-                hhrep_code = str(jx.get("hhrep") or "").strip()
+                hhrep_code = str(self._json_ext_lookup(jx, "hhrep") or "").strip()
 
                 desired_role = self._group_individual_role_from_json_ext(jx)
                 desired_recipient = (
