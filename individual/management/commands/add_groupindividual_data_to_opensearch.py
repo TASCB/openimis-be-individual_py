@@ -48,11 +48,7 @@ class Command(BaseCommand):
                 doc = GroupIndividualDocument(
                     meta={'id': obj.id},  # set document ID
                     group=document.prepare_group(obj),
-                    individual={
-                        "first_name": obj.individual.first_name,
-                        "last_name": obj.individual.last_name,
-                        "dob": obj.individual.dob,
-                    },
+                    individual=document.prepare_individual(obj),
                     role=obj.role,
                     recipient_type=obj.recipient_type,
                     json_ext={},

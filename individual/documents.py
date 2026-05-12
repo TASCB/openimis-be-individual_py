@@ -18,6 +18,25 @@ if 'opensearch_reports' in apps.app_configs:
     # skip indexing on model update when running unit tests to avoid connection issues
     auto_refresh = not is_unit_test_env
 
+    def extract_gender(json_ext):
+        """Pull a normalized gender ("M"/"F") out of an Individual.json_ext.
+
+        Tolerates the flat shape and the legacy nested ``json_ext['json_ext']``
+        shape, and the value being stored under either ``gender`` or ``sex``.
+        """
+        jx = json_ext or {}
+        if not isinstance(jx, dict):
+            return None
+        nested = jx.get('json_ext') if isinstance(jx.get('json_ext'), dict) else {}
+        value = (
+            jx.get('gender') or jx.get('sex')
+            or nested.get('gender') or nested.get('sex')
+        )
+        if value in (None, ''):
+            return None
+        value = str(value).strip().upper()
+        return value or None
+
     @registry.register_document
     class IndividualDocument(BaseSyncDocument):
         DASHBOARD_NAME = 'Individual'
@@ -25,6 +44,7 @@ if 'opensearch_reports' in apps.app_configs:
         first_name = opensearch_fields.KeywordField()
         last_name = opensearch_fields.KeywordField()
         dob = opensearch_fields.DateField()
+        gender = opensearch_fields.KeywordField()
         date_created = opensearch_fields.DateField()
         json_ext = opensearch_fields.ObjectField(dynamic=False)
 
@@ -42,6 +62,9 @@ if 'opensearch_reports' in apps.app_configs:
                 'id'
             ]
             queryset_pagination = 5000
+
+        def prepare_gender(self, instance):
+            return extract_gender(getattr(instance, 'json_ext', None))
 
         def prepare_json_ext(self, instance):
             return {}
@@ -81,6 +104,7 @@ if 'opensearch_reports' in apps.app_configs:
             'first_name': opensearch_fields.KeywordField(),
             'last_name': opensearch_fields.KeywordField(),
             'dob': opensearch_fields.DateField(),
+            'gender': opensearch_fields.KeywordField(),
         })
         role = opensearch_fields.KeywordField()
         recipient_type = opensearch_fields.KeywordField()
@@ -109,6 +133,15 @@ if 'opensearch_reports' in apps.app_configs:
                 )
             elif isinstance(related_instance, Individual):
                 return GroupIndividual.objects.filter(individual=related_instance)
+
+        def prepare_individual(self, instance):
+            ind = instance.individual
+            return {
+                'first_name': ind.first_name,
+                'last_name': ind.last_name,
+                'dob': ind.dob,
+                'gender': extract_gender(getattr(ind, 'json_ext', None)),
+            }
 
         def prepare_group(self, instance):
             group = instance.group

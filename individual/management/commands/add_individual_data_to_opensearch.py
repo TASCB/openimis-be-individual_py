@@ -1,6 +1,6 @@
 from django.core.management.base import BaseCommand
 from individual.models import Individual
-from individual.documents import IndividualDocument
+from individual.documents import IndividualDocument, extract_gender
 
 
 class Command(BaseCommand):
@@ -49,6 +49,7 @@ class Command(BaseCommand):
                     first_name=obj.first_name,
                     last_name=obj.last_name,
                     dob=obj.dob,
+                    gender=extract_gender(obj.json_ext),
                     date_created=obj.date_created,
                     json_ext=obj.json_ext,
                 )
