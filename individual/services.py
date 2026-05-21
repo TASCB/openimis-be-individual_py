@@ -1293,6 +1293,48 @@ class IndividualImportService:
             cls._json_ext_lookup(json_ext, "gender"),
         )
 
+    @classmethod
+    def _group_link_sort_key(cls, individual):
+        """
+        Keep group-linking deterministic and process the actual household HEAD
+        first. This avoids temporary HEAD/PRIMARY auto-promotions on the first
+        linked member that later get nulled when the real head is added.
+        """
+        json_ext = individual.json_ext or {}
+        role_code = str(
+            cls._json_ext_lookup(
+                json_ext,
+                "individual_role_code",
+                "rel_to_hhh",
+                "relationship_to_head",
+            )
+            or ""
+        ).strip()
+        hhrep_code = str(cls._json_ext_lookup(json_ext, "hhrep") or "").strip()
+        desired_role = cls._group_individual_role_from_json_ext(json_ext)
+        desired_primary = bool(hhrep_code and hhrep_code == role_code)
+
+        member_ordinal = cls._json_ext_lookup(
+            json_ext,
+            "member_ordinal",
+            "roster_index",
+            "roster__index",
+            "hhroster__id",
+            "memberlineno",
+        )
+        try:
+            ordinal_rank = int(str(member_ordinal).strip())
+        except (TypeError, ValueError):
+            ordinal_rank = 10 ** 9
+
+        role_rank = 2
+        if desired_role == GroupIndividual.Role.HEAD:
+            role_rank = 0
+        elif desired_primary:
+            role_rank = 1
+
+        return role_rank, ordinal_rank, str(individual.id)
+
     @register_service_signal("individual.import_individuals")
     def import_individuals(
         self,
@@ -1761,11 +1803,12 @@ class IndividualImportService:
             if isinstance(c, str) and c.strip():
                 group_col = c.strip()
 
-        inds = Individual.objects.filter(
+        inds = list(Individual.objects.filter(
             individualdatasource__upload=upload, is_deleted=False
-        ).distinct()
+        ).distinct())
+        inds.sort(key=self._group_link_sort_key)
 
-        if not inds.exists():
+        if not inds:
             return {
                 "success": True,
                 "group_column": group_col,
