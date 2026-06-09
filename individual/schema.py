@@ -33,6 +33,7 @@ from individual.gql_mutations import (
     UndoDeleteIndividualMutation,
     ConfirmGroupEnrollmentMutation,
     RerunPmtMutation,
+    AdjustPmtCutoffMutation,
     CreatePmtConfigMutation,
     UpdatePmtConfigMutation,
     DeletePmtConfigMutation,
@@ -40,6 +41,7 @@ from individual.gql_mutations import (
     UpdatePmtEnrollmentMutation,
     DisenrollPmtEnrollmentMutation,
     CreateDeduplicationIndividualReviewMutation,
+    UpdatePmtGlobalFormulaMutation,
 )
 from individual.gql_queries import (
     IndividualGQLType,
@@ -63,6 +65,7 @@ from individual.gql_queries import (
     PmtAuditSummaryResultType,
     PmtEnrollmentResultType,
     PmtRunProgressType,
+    PmtGlobalFormulaGQLType,
     apply_non_consented_filter,
     non_consented_marker_q,
 )
@@ -266,6 +269,11 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         mutation_id=graphene.UUID(required=True),
     )
 
+    pmt_global_formula = graphene.Field(
+        PmtGlobalFormulaGQLType,
+        description="The single global PMT formula (provisioned on first read).",
+    )
+
     individual_deduplication_summary = graphene.Field(
         DeduplicationSummaryGQLType,
         columns=graphene.List(graphene.String, required=True),
@@ -439,6 +447,32 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
             )
         except PmtRunProgress.DoesNotExist:
             return None
+
+    def resolve_pmt_global_formula(self, info, **kwargs):
+        from individual.pmt_service import PmtGlobalFormulaService
+        from tasks_management.models import Task
+
+        Query._check_permissions(
+            info.context.user, IndividualConfig.gql_pmt_formula_search_perms
+        )
+
+        formula = PmtGlobalFormulaService(info.context.user).get_or_create_active()
+
+        has_pending = Task.objects.filter(
+            business_event="PmtGlobalFormulaService.update",
+        ).exclude(
+            status__in=[Task.Status.COMPLETED, Task.Status.FAILED],
+        ).exists()
+
+        return PmtGlobalFormulaGQLType(
+            id=str(formula.id),
+            is_active=formula.is_active,
+            formula=formula.formula,
+            version=formula.version,
+            date_updated=formula.date_updated,
+            updated_by=getattr(formula.user_updated, "username", None),
+            has_pending_task=has_pending,
+        )
 
     def resolve_individual_enrollment_summary(self, info, **kwargs):
         Query._check_permissions(
@@ -987,6 +1021,7 @@ class Mutation(graphene.ObjectType):
     confirm_group_enrollment = ConfirmGroupEnrollmentMutation.Field()
 
     rerun_pmt = RerunPmtMutation.Field()
+    adjust_pmt_cutoff = AdjustPmtCutoffMutation.Field()
 
     create_pmt_config = CreatePmtConfigMutation.Field()
     update_pmt_config = UpdatePmtConfigMutation.Field()
@@ -995,6 +1030,8 @@ class Mutation(graphene.ObjectType):
     create_pmt_enrollment = CreatePmtEnrollmentMutation.Field()
     update_pmt_enrollment = UpdatePmtEnrollmentMutation.Field()
     disenroll_pmt_enrollment = DisenrollPmtEnrollmentMutation.Field()
+
+    update_pmt_global_formula = UpdatePmtGlobalFormulaMutation.Field()
 
     create_individual_deduplication_review = CreateDeduplicationIndividualReviewMutation.Field()
 

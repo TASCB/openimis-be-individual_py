@@ -3,9 +3,61 @@ from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.contrib.contenttypes.models import ContentType
 
-from individual.models import Individual, IndividualDataSource, GroupIndividual, Group
+from individual.models import Individual, IndividualDataSource, GroupIndividual, Group, PmtGlobalFormula
 from core.validation import BaseModelValidation, ObjectExistsValidationMixin
 from tasks_management.models import Task
+
+
+class PmtGlobalFormulaValidation(BaseModelValidation):
+    OBJECT_TYPE = PmtGlobalFormula
+
+    _NUMERIC_KEYS = ("intercept", "household_size_coef", "working_age_coef", "urban_coef")
+
+    @classmethod
+    def _validate_formula(cls, **data):
+        errors = []
+        formula = data.get("formula")
+        if formula is None:
+            return errors
+        if not isinstance(formula, dict):
+            return [_("individual.validation.pmt_formula.not_an_object")]
+
+        cutoff = formula.get("cutoff")
+        if cutoff is None:
+            errors += [_("individual.validation.pmt_formula.cutoff_required")]
+        else:
+            try:
+                c = float(cutoff)
+                if c <= 0 or c > 50:
+                    errors += [_("individual.validation.pmt_formula.cutoff_out_of_range")]
+            except (TypeError, ValueError):
+                errors += [_("individual.validation.pmt_formula.cutoff_not_numeric")]
+
+        for key in cls._NUMERIC_KEYS:
+            value = formula.get(key)
+            if value is None:
+                continue
+            try:
+                float(value)
+            except (TypeError, ValueError):
+                errors += [_("individual.validation.pmt_formula.coef_not_numeric") % {"key": key}]
+
+        assets = formula.get("assets") or {}
+        if not isinstance(assets, dict):
+            errors += [_("individual.validation.pmt_formula.assets_not_an_object")]
+        else:
+            for code, coef in assets.items():
+                try:
+                    float(coef)
+                except (TypeError, ValueError):
+                    errors += [_("individual.validation.pmt_formula.asset_coef_not_numeric") % {"code": code}]
+        return errors
+
+    @classmethod
+    def validate_update(cls, user, **data):
+        errors = cls._validate_formula(**data)
+        if errors:
+            raise ValidationError(errors)
 
 
 class IndividualValidation(BaseModelValidation, ObjectExistsValidationMixin):

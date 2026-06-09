@@ -10,7 +10,7 @@ from core.gql.gql_mutations.base_mutation import BaseHistoryModelDeleteMutationM
     BaseHistoryModelUpdateMutationMixin, BaseHistoryModelCreateMutationMixin
 from core.schema import OpenIMISMutation
 from individual.apps import IndividualConfig
-from individual.models import Individual, Group, GroupIndividual
+from individual.models import Individual, Group, GroupIndividual, PmtGlobalFormula
 from individual.services import IndividualService, GroupService, GroupIndividualService, \
     CreateGroupAndMoveIndividualService, CreateDeduplicationIndividualReviewTasksService
 from location.models import Location, LocationManager
@@ -557,6 +557,31 @@ class CreateGroupAndMoveIndividualMutation(BaseHistoryModelCreateMutationMixin, 
         group_individual_id = graphene.UUID(required=True)
 
 
+def _is_pct_benefit_plan(benefit_plan_id):
+    """
+    True when ``benefit_plan_id`` resolves to the configured PCT benefit plan.
+
+    PCT enrollment is driven automatically from PMT eligibility
+    (``PctAutoEnrollmentService``); the manual selection-task mutations must not
+    be used as a second enrollment surface for that plan. Returns False — i.e.
+    allow the standard openIMIS manual enrollment — for every other plan, and
+    whenever social_protection is unavailable or the PCT plan is not
+    configured/found.
+    """
+    pct_code = (IndividualConfig.pct_benefit_plan_code or "").strip()
+    if not pct_code or not benefit_plan_id:
+        return False
+    try:
+        from social_protection.models import BenefitPlan
+    except Exception:
+        return False
+    return BenefitPlan.objects.filter(
+        id=benefit_plan_id,
+        code=pct_code,
+        is_deleted=False,
+    ).exists()
+
+
 class ConfirmIndividualEnrollmentMutation(BaseHistoryModelCreateMutationMixin, BaseMutation):
     _mutation_class = "ConfirmIndividualEnrollmentMutation"
     _mutation_module = "individual"
@@ -568,6 +593,8 @@ class ConfirmIndividualEnrollmentMutation(BaseHistoryModelCreateMutationMixin, B
         if not user.has_perms(
                 IndividualConfig.gql_group_create_perms):
             raise PermissionDenied(_("unauthorized"))
+        if _is_pct_benefit_plan(data.get('benefit_plan_id')):
+            raise ValidationError(_("individual.enrollment.pct_manual_blocked"))
 
     @classmethod
     def _mutate(cls, user, **data):
@@ -602,6 +629,8 @@ class ConfirmGroupEnrollmentMutation(BaseHistoryModelCreateMutationMixin, BaseMu
         if not user.has_perms(
                 IndividualConfig.gql_group_create_perms):
             raise PermissionDenied(_("unauthorized"))
+        if _is_pct_benefit_plan(data.get('benefit_plan_id')):
+            raise ValidationError(_("individual.enrollment.pct_manual_blocked"))
 
     @classmethod
     def _mutate(cls, user, **data):
@@ -709,6 +738,94 @@ class RerunPmtMutation(OpenIMISMutation):
         except Exception as e:
             logger.error(
                 f"RerunPmtMutation: Unexpected error: {str(e)}", exc_info=True
+            )
+            return cls(
+                ok=False,
+                errors=[f"Mutation failed: {str(e)}"],
+                updated_individuals=0,
+                updated_groups=0,
+                mutation_id=mutation_id,
+                district_code=district_code,
+            )
+
+
+class AdjustPmtCutoffInputType(OpenIMISMutation.Input):
+    district_code = graphene.String(required=True)
+    region_code = graphene.String(required=False)
+    pmt_cutoff = graphene.Float(required=True)
+
+
+class AdjustPmtCutoffMutation(OpenIMISMutation):
+    Input = AdjustPmtCutoffInputType
+
+    _mutation_class = "AdjustPmtCutoffMutation"
+    _mutation_module = "individual"
+
+    ok = graphene.Boolean()
+    errors = graphene.List(graphene.String)
+    updated_individuals = graphene.Int()
+    updated_groups = graphene.Int()
+    mutation_id = graphene.UUID()
+    district_code = graphene.String()
+
+    @classmethod
+    def mutate_and_get_payload(cls, root, info, **input_data):
+        import uuid
+        from django.contrib.auth.models import AnonymousUser
+        from django.core.exceptions import PermissionDenied
+
+        district_code = input_data.get("district_code")
+        mutation_id = None
+
+        try:
+            user = info.context.user if info and info.context else None
+
+            if type(user) is AnonymousUser or not user or not user.id:
+                raise PermissionDenied(_("mutation.authentication_required"))
+
+            if not user.has_perms(IndividualConfig.gql_pmt_rerun_perms):
+                raise PermissionDenied(_("unauthorized"))
+
+            region_code = input_data.get("region_code")
+            pmt_cutoff = input_data.get("pmt_cutoff", 11.01)
+            mutation_id = str(uuid.uuid4())
+
+            from individual.tasks import adjust_pmt_cutoff_task
+            adjust_pmt_cutoff_task.delay(
+                district_code=district_code,
+                region_code=region_code,
+                pmt_cutoff=float(pmt_cutoff),
+                user_id=str(user.id),
+                mutation_id=mutation_id,
+            )
+
+            logger.info(
+                f"AdjustPmtCutoffMutation: dispatched async task "
+                f"district={district_code}, mutation_id={mutation_id}"
+            )
+
+            return cls(
+                ok=True,
+                errors=[],
+                updated_individuals=0,
+                updated_groups=0,
+                mutation_id=mutation_id,
+                district_code=district_code,
+            )
+
+        except PermissionDenied as e:
+            logger.warning(f"AdjustPmtCutoffMutation: Permission denied: {str(e)}")
+            return cls(
+                ok=False,
+                errors=[str(e)],
+                updated_individuals=0,
+                updated_groups=0,
+                mutation_id=mutation_id,
+                district_code=district_code,
+            )
+        except Exception as e:
+            logger.error(
+                f"AdjustPmtCutoffMutation: Unexpected error: {str(e)}", exc_info=True
             )
             return cls(
                 ok=False,
@@ -1055,3 +1172,37 @@ class CreateDeduplicationIndividualReviewMutation(OpenIMISMutation):
             logger.error(f"CreateDeduplicationIndividualReviewMutation: Unexpected error: {str(e)}", exc_info=True)
             return cls(ok=False, errors=[f"Mutation failed: {str(e)}"])
 
+
+class UpdatePmtGlobalFormulaInputType(OpenIMISMutation.Input):
+    id = graphene.String(required=True)
+    formula = graphene.types.json.JSONString(required=True)
+    is_active = graphene.Boolean(required=False)
+
+
+class UpdatePmtGlobalFormulaMutation(BaseMutation):
+    """
+    Maker side of the global PMT formula. Does NOT write the formula directly:
+    it creates a tasks_management approval task via the service's checker mixin,
+    so the change only takes effect once a second user approves the task.
+    """
+    _mutation_class = "UpdatePmtGlobalFormulaMutation"
+    _mutation_module = "individual"
+    _model = PmtGlobalFormula
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(IndividualConfig.gql_pmt_formula_update_perms):
+            raise PermissionDenied(_("unauthorized"))
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        data.pop('client_mutation_id', None)
+        data.pop('client_mutation_label', None)
+
+        from individual.pmt_service import PmtGlobalFormulaService
+        result = PmtGlobalFormulaService(user).create_update_task(data)
+        return result if not result['success'] else None
+
+    class Input(UpdatePmtGlobalFormulaInputType):
+        pass

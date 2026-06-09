@@ -20,6 +20,8 @@ DEFAULT_CONFIG = {
     "gql_group_update_perms": ["180003"],
     "gql_group_delete_perms": ["180004"],
     "gql_pmt_rerun_perms": ["180005"],
+    "gql_pmt_formula_search_perms": ["180006"],
+    "gql_pmt_formula_update_perms": ["180007"],
     "check_individual_update": True,
     "check_individual_delete": True,
     "check_group_individual_update": True,
@@ -34,6 +36,10 @@ DEFAULT_CONFIG = {
     "validation_upload_valid_items": "individual_validation.upload_valid_items",
     "validation_upload_valid_items_workflow": "individual-upload-valid-items.individual-upload-valid-items",
     "deduplication_review_event": "individual_deduplication.resolve",
+    "pct_auto_enroll_enabled": True,
+    "pct_auto_enroll_on_rerun": True,
+    "pct_benefit_plan_code": "002",
+    "pct_group_beneficiary_status": "ACTIVE",
     "enable_python_workflows": True,
     "enable_maker_checker_logic_import": True,
     "enable_maker_checker_for_individual_upload": True,
@@ -65,6 +71,8 @@ class IndividualConfig(AppConfig):
     gql_group_update_perms = None
     gql_group_delete_perms = None
     gql_pmt_rerun_perms = None
+    gql_pmt_formula_search_perms = None
+    gql_pmt_formula_update_perms = None
     check_individual_update = None
     check_individual_delete = None
     check_group_individual_update = None
@@ -85,6 +93,10 @@ class IndividualConfig(AppConfig):
     validation_upload_valid_items_workflow = None
     validation_upload_valid_items = None
     deduplication_review_event = None
+    pct_auto_enroll_enabled = None
+    pct_auto_enroll_on_rerun = None
+    pct_benefit_plan_code = None
+    pct_group_beneficiary_status = None
 
     enable_maker_checker_for_individual_upload = None
     enable_maker_checker_for_group_upload = None

@@ -12,6 +12,7 @@ from individual.models import (
     IndividualDataSource,
     IndividualDataSourceUpload,
     IndividualDataUploadRecords,
+    GroupIndividual,
 )
 from individual.tests.test_helpers import (
     generate_random_string,
@@ -246,6 +247,72 @@ class IndividualImportServiceTest(TestCase):
                 f'Expected rows with location_name={self.village_a.name} to pass validation, but failed: {loc_validation}'
             )
             self.assertEqual(loc_validation.get('field_name'), 'location_name')
+
+    def test_link_groups_for_upload_uuid_processes_head_before_other_members(self):
+        service = IndividualImportService(self.admin_user)
+        upload = IndividualDataSourceUpload(
+            source_name="ordered-household.csv",
+            source_type="individual import",
+        )
+        upload.save(user=self.admin_user)
+
+        group_code = "P3-TEST-ORDER"
+
+        child = create_individual(self.admin_user.username, {
+            "first_name": "Child",
+            "last_name": "Member",
+            "location": self.village_a,
+            "json_ext": {
+                "group_code": group_code,
+                "individual_role": "OTHER RELATIVE",
+                "individual_role_code": "3",
+                "hhrep": "2",
+                "member_ordinal": 3,
+            },
+        })
+        spouse = create_individual(self.admin_user.username, {
+            "first_name": "Spouse",
+            "last_name": "Member",
+            "location": self.village_a,
+            "json_ext": {
+                "group_code": group_code,
+                "individual_role": "SPOUSE",
+                "individual_role_code": "2",
+                "hhrep": "2",
+                "member_ordinal": 2,
+            },
+        })
+        head = create_individual(self.admin_user.username, {
+            "first_name": "Head",
+            "last_name": "Member",
+            "location": self.village_a,
+            "json_ext": {
+                "group_code": group_code,
+                "individual_role": "HEAD",
+                "individual_role_code": "1",
+                "hhrep": "2",
+                "member_ordinal": 1,
+            },
+        })
+
+        for individual in (child, spouse, head):
+            IndividualDataSource(
+                individual=individual,
+                upload=upload,
+            ).save(user=self.admin_user)
+
+        result = service.link_groups_for_upload_uuid(str(upload.uuid))
+        self.assertTrue(result["success"])
+
+        child_link = GroupIndividual.objects.get(individual=child, is_deleted=False)
+        spouse_link = GroupIndividual.objects.get(individual=spouse, is_deleted=False)
+        head_link = GroupIndividual.objects.get(individual=head, is_deleted=False)
+
+        self.assertEqual(head_link.role, GroupIndividual.Role.HEAD)
+        self.assertEqual(spouse_link.role, GroupIndividual.Role.SPOUSE)
+        self.assertEqual(spouse_link.recipient_type, GroupIndividual.RecipientType.PRIMARY)
+        self.assertEqual(child_link.role, GroupIndividual.Role.OTHER_RELATIVE)
+        self.assertIsNone(child_link.recipient_type)
 
         # User from district a can import individuals without location specified
         rows_empty_location = [row for row in validated_rows if row['row']['location_name'] == '']

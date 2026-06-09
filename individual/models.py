@@ -460,3 +460,99 @@ class PmtRunProgress(models.Model):
         elif self.status == self.Status.FAILED:
             return f"Failed: {', '.join(self.errors[:2])}"  # Show first 2 errors
         return "Processing..."
+
+
+# ---------------------------------------------------------------------------
+# Global PMT formula configuration (maker-checker editable)
+# ---------------------------------------------------------------------------
+class PmtGlobalFormula(HistoryModel):
+    """
+    Single, system-wide PMT scoring formula. Holds the regression coefficients
+    and the POOR/NON_POOR cutoff that were previously hard-coded in
+    ``api_etl.workflows.pmt``.
+
+    Exactly one active row is expected (``get_active``). Edits go through the
+    tasks_management maker-checker flow (see ``PmtGlobalFormulaService``), so a
+    proposed change only becomes effective once a second user approves it.
+
+    The whole formula is stored in a single JSON column (``formula``) rather than
+    typed float columns on purpose: core's ``pre_save`` validator resets any
+    *falsy* field value back to its default, which would silently revert a
+    coefficient legitimately edited to ``0``. Nested JSON values are not touched.
+
+        formula = {
+            "cutoff": 11.01,                # POOR if score <= cutoff
+            "intercept": 11.688,
+            "household_size_coef": -0.10,
+            "working_age_coef": -0.043,     # per member aged 15-64
+            "urban_coef": 0.0,
+            "assets": {"9": 0.25, "5": 0.179, ...},  # asset code -> coefficient
+        }
+    """
+    USE_CACHE = False
+
+    is_active = models.BooleanField(
+        default=True,
+        help_text="Only the active formula is used for scoring/classification.",
+    )
+
+    formula = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text="Coefficients + cutoff. See model docstring for shape.",
+    )
+
+    json_ext = models.JSONField(db_column="Json_ext", blank=True, default=dict)
+
+    class Meta:
+        managed = True
+        verbose_name = "PMT Global Formula"
+        verbose_name_plural = "PMT Global Formula"
+
+    def __str__(self):
+        cutoff = (self.formula or {}).get("cutoff")
+        return f"PMT Formula (cutoff {cutoff}, {'active' if self.is_active else 'inactive'})"
+
+    @classmethod
+    def get_active(cls):
+        """Return the active formula row, or None when none is configured."""
+        return cls.objects.filter(is_active=True, is_deleted=False).order_by("-date_updated").first()
+
+    def as_coeffs(self) -> dict:
+        """
+        Merge the stored formula over the engine defaults and normalize, so the
+        result is always a complete coefficient dict for compute_household_pmt_score.
+        """
+        # Lazy import keeps api_etl an optional dependency and avoids load-order cycles.
+        try:
+            from api_etl.workflows.pmt import DEFAULT_COEFFS
+            coeffs = dict(DEFAULT_COEFFS)
+        except Exception:
+            coeffs = {}
+        stored = self.formula if isinstance(self.formula, dict) else {}
+        for key in ("cutoff", "intercept", "household_size_coef", "working_age_coef", "urban_coef"):
+            if stored.get(key) is not None:
+                try:
+                    coeffs[key] = float(stored[key])
+                except (TypeError, ValueError):
+                    pass
+        assets = {}
+        for code, coef in (stored.get("assets") or coeffs.get("assets") or {}).items():
+            try:
+                assets[str(code)] = float(coef)
+            except (TypeError, ValueError):
+                continue
+        coeffs["assets"] = assets
+        return coeffs
+
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        if queryset is None:
+            queryset = cls.objects.all()
+        if not settings.ROW_SECURITY:
+            return queryset
+        if user.is_anonymous:
+            return queryset.filter(id=-1)
+        if not user.is_imis_admin:
+            return queryset.filter(id=-1)
+        return queryset

@@ -22,8 +22,12 @@ from django.db.models.fields.json import KeyTextTransform
 from django.utils import timezone
 
 from core.services import BaseService
-from individual.models import Individual, Group, GroupIndividual, PmtConfig, PmtEnrollment
+from core.signals import register_service_signal
+from individual.apps import IndividualConfig
+from individual.models import Individual, Group, GroupIndividual, PmtConfig, PmtEnrollment, PmtGlobalFormula
+from individual.validation import PmtGlobalFormulaValidation
 from location.models import LocationManager
+from tasks_management.services import UpdateCheckerLogicServiceMixin
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +54,9 @@ class PmtService(BaseService):
         So we implement _classify_pmt locally.
         """
         try:
-            from api_etl.workflows.pmt import compute_household_pmt_score
+            from api_etl.workflows.pmt import compute_household_pmt_score, get_active_coeffs
             self.compute_household_pmt_score = compute_household_pmt_score
+            self.get_active_coeffs = get_active_coeffs
             self.pmt_available = True
         except ImportError as e:
             logger.warning(f"api_etl module not available for PMT calculation: {e}")
@@ -475,6 +480,9 @@ class PmtService(BaseService):
             updated_groups_count = 0
             errors = []
 
+            # Resolve the active formula once for the whole rerun (avoids a query per household).
+            active_coeffs = self.get_active_coeffs()
+
             for idx, group in enumerate(groups_list):
                 try:
                     group_individuals = list(group.groupindividuals.all())
@@ -524,7 +532,7 @@ class PmtService(BaseService):
                     members_data = [{"dob": m.dob} for m in members]
 
                     # REUSE: Call PMT score calculation from api_etl module
-                    new_pmt_score = self.compute_household_pmt_score(hh_data, members_data)
+                    new_pmt_score = self.compute_household_pmt_score(hh_data, members_data, active_coeffs)
 
                     # Sanity check: PMT scores should typically be between 5-15
                     # (Outside this range might indicate data quality issues)
@@ -541,6 +549,13 @@ class PmtService(BaseService):
                     head.json_ext["pmt_score"] = new_pmt_score
                     if new_pmt_class:
                         head.json_ext["pmt_class"] = new_pmt_class
+                    self._annotate_pmt_audit_metadata(
+                        head.json_ext,
+                        operation="RERUN",
+                        pmt_cutoff=pmt_cutoff,
+                        mutation_id=mutation_id,
+                        district_code=district_code,
+                    )
                     try:
                         head.save(user=self.user)
                     except ValidationError as ve:
@@ -556,6 +571,13 @@ class PmtService(BaseService):
                         member.json_ext["pmt_score"] = new_pmt_score
                         if new_pmt_class:
                             member.json_ext["pmt_class"] = new_pmt_class
+                        self._annotate_pmt_audit_metadata(
+                            member.json_ext,
+                            operation="RERUN",
+                            pmt_cutoff=pmt_cutoff,
+                            mutation_id=mutation_id,
+                            district_code=district_code,
+                        )
                         try:
                             member.save(user=self.user)
                         except ValidationError as ve:
@@ -571,6 +593,13 @@ class PmtService(BaseService):
 
                     # Store the cutoff actually used for this rerun (so audit summary can display it)
                     group.json_ext["pmt_cutoff_used"] = float(pmt_cutoff)
+                    self._annotate_pmt_audit_metadata(
+                        group.json_ext,
+                        operation="RERUN",
+                        pmt_cutoff=pmt_cutoff,
+                        mutation_id=mutation_id,
+                        district_code=district_code,
+                    )
 
                     try:
                         group.save(user=self.user)
@@ -618,6 +647,15 @@ class PmtService(BaseService):
                         pmt_cutoff=pmt_cutoff,
                         progress=progress
                     )
+
+                    pct_sync_result = None
+                    if IndividualConfig.pct_auto_enroll_on_rerun:
+                        pct_sync_result = PctAutoEnrollmentService(self.user).sync_pending_poor_households(
+                            district_code=district_code,
+                            region_code=region_code,
+                        )
+                        logger.info("PCT downstream enrollment sync result: %s", pct_sync_result)
+
                     logger.info("Auto-enrollment workflow completed successfully")
 
                     # Update progress with enrollment count
@@ -661,6 +699,275 @@ class PmtService(BaseService):
                 "updated_individuals": 0,
                 "updated_groups": 0,
             }
+
+    @transaction.atomic()
+    def adjust_pmt_cutoff(self, district_code, region_code=None, pmt_cutoff=11.01, mutation_id=None):
+        """
+        Reclassify households and members using an updated cutoff while reusing the
+        stored household PMT score instead of recalculating it from survey data.
+        """
+        start_time = time.time()
+        logger.info(
+            f"PMT cutoff adjustment started: district={district_code}, "
+            f"region={region_code}, cutoff={pmt_cutoff}, mutation_id={mutation_id}"
+        )
+
+        progress = None
+        if mutation_id:
+            try:
+                from individual.models import PmtRunProgress
+                progress, created = PmtRunProgress.objects.update_or_create(
+                    mutation_id=mutation_id,
+                    defaults={
+                        'status': PmtRunProgress.Status.STARTED,
+                        'district_code': district_code,
+                    }
+                )
+                logger.info(f"PMT cutoff adjustment tracking initialized for mutation {mutation_id}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize PMT cutoff adjustment tracking: {str(e)}")
+
+        try:
+            if not district_code:
+                return {
+                    "success": False,
+                    "errors": ["district_code is required"],
+                    "updated_individuals": 0,
+                    "updated_groups": 0,
+                }
+
+            try:
+                pmt_cutoff = float(pmt_cutoff)
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "errors": ["Invalid pmt_cutoff value - must be a valid number"],
+                    "updated_individuals": 0,
+                    "updated_groups": 0,
+                }
+
+            if pmt_cutoff < 0 or pmt_cutoff > 50:
+                return {
+                    "success": False,
+                    "errors": [f"PMT cutoff must be between 0 and 50, received {pmt_cutoff}"],
+                    "updated_individuals": 0,
+                    "updated_groups": 0,
+                }
+
+            member_prefetch = Prefetch(
+                "groupindividuals",
+                queryset=GroupIndividual.objects.filter(
+                    is_deleted=False,
+                    individual__is_deleted=False,
+                ).select_related("individual"),
+            )
+            groups_query = self._apply_location_filter(
+                Group.objects.filter(is_deleted=False),
+                district_code=district_code,
+                region_code=region_code,
+            ).prefetch_related(member_prefetch)
+
+            groups = Group.get_queryset(groups_query, self.user)
+            groups_list = list(groups)
+            total_groups = len(groups_list)
+            total_individuals = sum(len(group.groupindividuals.all()) for group in groups_list)
+
+            if progress:
+                from individual.models import PmtRunProgress
+                progress.total_groups = total_groups
+                progress.total_individuals = total_individuals
+                progress.status = PmtRunProgress.Status.CALCULATING
+                progress.save()
+
+            updated_individuals_count = 0
+            updated_groups_count = 0
+            errors = []
+
+            for group in groups_list:
+                try:
+                    group_individuals = list(group.groupindividuals.all())
+                    members = [group_individual.individual for group_individual in group_individuals]
+                    if not members:
+                        continue
+
+                    existing_pmt_score = self._get_existing_household_pmt_score(group, members)
+                    if existing_pmt_score is None:
+                        errors.append(
+                            f"Household {group.code} has no stored PMT score - skipped during cutoff adjustment"
+                        )
+                        continue
+
+                    new_pmt_class = self._classify_pmt(existing_pmt_score, pmt_cutoff)
+
+                    for member in members:
+                        member.json_ext = member.json_ext or {}
+                        member.json_ext["pmt_score"] = existing_pmt_score
+                        if new_pmt_class:
+                            member.json_ext["pmt_class"] = new_pmt_class
+                        self._annotate_pmt_audit_metadata(
+                            member.json_ext,
+                            operation="CUTOFF_ADJUSTMENT",
+                            pmt_cutoff=pmt_cutoff,
+                            mutation_id=mutation_id,
+                            district_code=district_code,
+                        )
+                        try:
+                            member.save(user=self.user)
+                        except ValidationError as ve:
+                            if 'no changes in fields' not in str(ve):
+                                raise
+                        updated_individuals_count += 1
+
+                    group.json_ext = group.json_ext or {}
+                    group.json_ext["pmt_score_household"] = existing_pmt_score
+                    if new_pmt_class:
+                        group.json_ext["pmt_class_household"] = new_pmt_class
+                    group.json_ext["pmt_cutoff_used"] = float(pmt_cutoff)
+                    self._annotate_pmt_audit_metadata(
+                        group.json_ext,
+                        operation="CUTOFF_ADJUSTMENT",
+                        pmt_cutoff=pmt_cutoff,
+                        mutation_id=mutation_id,
+                        district_code=district_code,
+                    )
+
+                    try:
+                        group.save(user=self.user)
+                    except ValidationError as ve:
+                        if 'no changes in fields' not in str(ve):
+                            raise
+                    updated_groups_count += 1
+
+                    if progress and (updated_groups_count % 10 == 0 or updated_groups_count == total_groups):
+                        progress.processed_groups = updated_groups_count
+                        progress.processed_individuals = updated_individuals_count
+                        progress.save()
+
+                except (IntegrityError, ValueError, TypeError) as e:
+                    logger.error(
+                        f"Error adjusting PMT cutoff for group {group.code}: {str(e)}",
+                        exc_info=True
+                    )
+                    errors.append(
+                        f"Failed to adjust household {group.code} - verify stored PMT score data"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Unexpected error in PMT cutoff adjustment for group {group.code}: {str(e)}",
+                        exc_info=True,
+                        extra={"group_code": group.code}
+                    )
+                    errors.append("An unexpected error occurred - the operation may be incomplete")
+                    break
+
+            if updated_groups_count > 0:
+                logger.info(f"Triggering auto-enrollment after cutoff adjustment for {updated_groups_count} groups")
+
+                if progress:
+                    from individual.models import PmtRunProgress
+                    progress.status = PmtRunProgress.Status.ENROLLING
+                    progress.save()
+
+                try:
+                    enrollments_count = self._auto_enroll_poor_households(
+                        district_code=district_code,
+                        pmt_cutoff=pmt_cutoff,
+                        progress=progress
+                    )
+
+                    pct_sync_result = None
+                    if IndividualConfig.pct_auto_enroll_on_rerun:
+                        pct_sync_result = PctAutoEnrollmentService(self.user).sync_pending_poor_households(
+                            district_code=district_code,
+                            region_code=region_code,
+                        )
+                        logger.info(
+                            "PCT downstream enrollment sync after cutoff adjustment: %s",
+                            pct_sync_result
+                        )
+
+                    if progress:
+                        from individual.models import PmtRunProgress
+                        progress.enrollments_created = enrollments_count
+                        progress.poor_groups_found = enrollments_count
+                        progress.status = PmtRunProgress.Status.COMPLETED
+                        progress.completed_at = timezone.now()
+                        progress.save()
+
+                except Exception as e:
+                    logger.error(f"Cutoff adjustment auto-enrollment failed: {str(e)}", exc_info=True)
+                    errors.append(f"Auto-enrollment warning: {str(e)}")
+                    if progress:
+                        from individual.models import PmtRunProgress
+                        progress.status = PmtRunProgress.Status.COMPLETED
+                        progress.completed_at = timezone.now()
+                        progress.save()
+
+            elapsed = time.time() - start_time
+            logger.info(
+                f"PMT cutoff adjustment completed: {updated_groups_count} groups, "
+                f"{updated_individuals_count} individuals processed in {elapsed:.2f}s"
+            )
+
+            return {
+                "success": len(errors) == 0,
+                "errors": errors,
+                "updated_individuals": updated_individuals_count,
+                "updated_groups": updated_groups_count,
+                "district_code": district_code,
+            }
+
+        except Exception as e:
+            logger.error(f"Unexpected error in adjust_pmt_cutoff: {str(e)}", exc_info=True)
+            return {
+                "success": False,
+                "errors": ["An unexpected error occurred - please contact administrator"],
+                "updated_individuals": 0,
+                "updated_groups": 0,
+            }
+
+    def _get_existing_household_pmt_score(self, group, members):
+        """
+        Resolve the stored household PMT score from canonical group storage first,
+        then fall back to member-level mirrors for older data.
+        """
+        group_json_ext = group.json_ext or {}
+        candidates = [
+            group_json_ext.get("pmt_score_household"),
+            group_json_ext.get("pmt_score"),
+        ]
+
+        for member in members:
+            member_json_ext = member.json_ext or {}
+            candidates.extend([
+                member_json_ext.get("pmt_score"),
+                member_json_ext.get("pmt_score_household"),
+            ])
+
+        for candidate in candidates:
+            if candidate in (None, ""):
+                continue
+            try:
+                return float(candidate)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid stored PMT score for group %s: %s",
+                    getattr(group, "code", None),
+                    candidate,
+                )
+        return None
+
+    def _annotate_pmt_audit_metadata(self, json_ext, operation, pmt_cutoff, mutation_id=None, district_code=None):
+        if json_ext is None:
+            return
+
+        json_ext["pmt_last_operation"] = operation
+        json_ext["pmt_last_cutoff"] = float(pmt_cutoff)
+        json_ext["pmt_last_updated_at"] = timezone.now().isoformat()
+        if mutation_id:
+            json_ext["pmt_last_mutation_id"] = str(mutation_id)
+        if district_code:
+            json_ext["pmt_last_district_code"] = str(district_code)
 
     def _auto_enroll_poor_households(self, district_code, pmt_cutoff, progress=None):
         """
@@ -743,6 +1050,276 @@ class PmtService(BaseService):
         except Exception as e:
             logger.error(f"Error in auto-enrollment workflow: {str(e)}", exc_info=True)
             raise  # Re-raise so caller knows about the error
+
+
+class PctAutoEnrollmentService(BaseService):
+    """
+    Bridge PMT-based household eligibility into the downstream PCT group-beneficiary
+    enrollment used by payroll and payment modules.
+
+    Performance design:
+    - resolve the target PCT BenefitPlan once
+    - load candidate PmtEnrollments in one query
+    - load existing GroupBeneficiaries for the district in one query
+    - only write changed rows
+
+    Safety design:
+    - no-op when social_protection is unavailable
+    - no-op when the PCT benefit plan is not configured or not found
+    - idempotent across repeated reruns
+    """
+
+    SYNC_MARKER = "pct_auto_enrollment"
+
+    def __init__(self, user):
+        super().__init__(user)
+
+    def sync_pending_poor_households(self, district_code=None, region_code=None):
+        if not IndividualConfig.pct_auto_enroll_enabled:
+            return {
+                "success": True,
+                "created": 0,
+                "updated": 0,
+                "linked": 0,
+                "processed": 0,
+                "detail": "pct_auto_enroll_disabled",
+            }
+
+        deps = self._resolve_social_protection_dependencies()
+        if not deps:
+            return {
+                "success": True,
+                "created": 0,
+                "updated": 0,
+                "linked": 0,
+                "processed": 0,
+                "detail": "social_protection_unavailable",
+            }
+
+        benefit_plan = self._resolve_pct_benefit_plan(deps["BenefitPlan"])
+        if not benefit_plan:
+            return {
+                "success": True,
+                "created": 0,
+                "updated": 0,
+                "linked": 0,
+                "processed": 0,
+                "detail": "pct_benefit_plan_not_found",
+            }
+
+        enrollments = self._get_target_enrollments(
+            district_code=district_code,
+            region_code=region_code,
+        )
+        if not enrollments:
+            return {
+                "success": True,
+                "created": 0,
+                "updated": 0,
+                "linked": 0,
+                "processed": 0,
+                "detail": "no_pending_poor_households",
+            }
+
+        group_ids = [enrollment.group_id for enrollment in enrollments]
+        GroupBeneficiary = deps["GroupBeneficiary"]
+        existing_beneficiaries = (
+            GroupBeneficiary.objects
+            .filter(
+                group_id__in=group_ids,
+                benefit_plan=benefit_plan,
+                is_deleted=False,
+            )
+            .select_related("group", "benefit_plan")
+            .order_by("date_created")
+        )
+
+        existing_by_group = {}
+        for beneficiary in existing_beneficiaries:
+            existing_by_group.setdefault(beneficiary.group_id, beneficiary)
+
+        created = 0
+        updated = 0
+        linked = 0
+        target_status = str(IndividualConfig.pct_group_beneficiary_status or "ACTIVE")
+        synced_at = timezone.now()
+
+        with transaction.atomic():
+            for enrollment in enrollments:
+                beneficiary = existing_by_group.get(enrollment.group_id)
+                if beneficiary is None:
+                    beneficiary = GroupBeneficiary(
+                        group=enrollment.group,
+                        benefit_plan=benefit_plan,
+                        status=target_status,
+                        json_ext=self._build_group_beneficiary_json_ext(
+                            existing_json_ext=None,
+                            enrollment=enrollment,
+                            synced_at=synced_at,
+                            benefit_plan_code=getattr(benefit_plan, "code", None),
+                        ),
+                    )
+                    beneficiary.save(user=self.user)
+                    existing_by_group[enrollment.group_id] = beneficiary
+                    created += 1
+                else:
+                    beneficiary_changed = False
+                    desired_json_ext = self._build_group_beneficiary_json_ext(
+                        existing_json_ext=beneficiary.json_ext,
+                        enrollment=enrollment,
+                        synced_at=synced_at,
+                        benefit_plan_code=getattr(benefit_plan, "code", None),
+                    )
+                    if beneficiary.json_ext != desired_json_ext:
+                        beneficiary.json_ext = desired_json_ext
+                        beneficiary_changed = True
+                    if beneficiary.status != target_status:
+                        beneficiary.status = target_status
+                        beneficiary_changed = True
+                    if beneficiary_changed:
+                        beneficiary.save(user=self.user)
+                        updated += 1
+
+                enrollment_changed = False
+                beneficiary_reference = self._get_enrollment_beneficiary_reference(beneficiary)
+                if beneficiary_reference is not None and enrollment.beneficiary_id != beneficiary_reference:
+                    enrollment.beneficiary_id = beneficiary_reference
+                    enrollment_changed = True
+                if enrollment.status != PmtEnrollment.Status.ENROLLED:
+                    enrollment.status = PmtEnrollment.Status.ENROLLED
+                    enrollment_changed = True
+                if enrollment.enrollment_date is None:
+                    enrollment.enrollment_date = synced_at
+                    enrollment_changed = True
+
+                desired_enrollment_json = self._build_enrollment_json_ext(
+                    existing_json_ext=enrollment.json_ext,
+                    beneficiary=beneficiary,
+                    benefit_plan_code=getattr(benefit_plan, "code", None),
+                    synced_at=synced_at,
+                )
+                if enrollment.json_ext != desired_enrollment_json:
+                    enrollment.json_ext = desired_enrollment_json
+                    enrollment_changed = True
+
+                if enrollment_changed:
+                    enrollment.save(user=self.user)
+                    linked += 1
+
+        logger.info(
+            "PCT auto-enrollment sync completed: processed=%s created=%s updated=%s linked=%s district=%s region=%s",
+            len(enrollments), created, updated, linked, district_code, region_code,
+        )
+        return {
+            "success": True,
+            "created": created,
+            "updated": updated,
+            "linked": linked,
+            "processed": len(enrollments),
+            "detail": "ok",
+        }
+
+    def _resolve_social_protection_dependencies(self):
+        try:
+            from social_protection.models import BenefitPlan, GroupBeneficiary
+        except Exception as exc:
+            logger.warning("PCT auto-enrollment skipped: social_protection unavailable: %s", exc)
+            return None
+        return {
+            "BenefitPlan": BenefitPlan,
+            "GroupBeneficiary": GroupBeneficiary,
+        }
+
+    def _resolve_pct_benefit_plan(self, BenefitPlan):
+        benefit_plan_code = (IndividualConfig.pct_benefit_plan_code or "").strip()
+        if not benefit_plan_code:
+            logger.warning("PCT auto-enrollment skipped: pct_benefit_plan_code not configured")
+            return None
+
+        benefit_plan = BenefitPlan.objects.filter(
+            code=benefit_plan_code,
+            is_deleted=False,
+            type=BenefitPlan.BenefitPlanType.GROUP_TYPE,
+        ).first()
+        if not benefit_plan:
+            logger.warning(
+                "PCT auto-enrollment skipped: no GROUP benefit plan found for code=%s",
+                benefit_plan_code,
+            )
+        return benefit_plan
+
+    def _get_target_enrollments(self, district_code=None, region_code=None):
+        queryset = PmtEnrollment.objects.filter(
+            is_deleted=False,
+            pmt_class=PmtEnrollment.PmtClass.POOR,
+        ).filter(
+            Q(status=PmtEnrollment.Status.PENDING)
+            | Q(
+                status=PmtEnrollment.Status.ENROLLED,
+                beneficiary_id__isnull=True,
+                json_ext__pct_auto_enrollment__beneficiary_id__isnull=True,
+            )
+        )
+        queryset = self._apply_enrollment_location_filter(
+            queryset,
+            district_code=district_code,
+            region_code=region_code,
+        )
+        return list(queryset.select_related("group"))
+
+    @staticmethod
+    def _apply_enrollment_location_filter(queryset, district_code=None, region_code=None):
+        if district_code:
+            return queryset.filter(
+                Q(group__location__code=district_code)
+                | Q(group__location__parent__code=district_code)
+                | Q(group__location__parent__parent__code=district_code)
+            )
+
+        if region_code:
+            return queryset.filter(
+                Q(group__location__code=region_code)
+                | Q(group__location__parent__code=region_code)
+                | Q(group__location__parent__parent__code=region_code)
+                | Q(group__location__parent__parent__parent__code=region_code)
+            )
+
+        return queryset
+
+    def _build_group_beneficiary_json_ext(self, existing_json_ext, enrollment, synced_at, benefit_plan_code):
+        json_ext = dict(existing_json_ext or {})
+        json_ext[self.SYNC_MARKER] = {
+            "source": "pmt_enrollment",
+            "benefit_plan_code": benefit_plan_code,
+            "pmt_enrollment_id": str(enrollment.id),
+            "pmt_class": enrollment.pmt_class,
+            "pmt_score": float(enrollment.pmt_score),
+            "synced_at": synced_at.isoformat(),
+            "synced_by": getattr(self.user, "username", None),
+        }
+        return json_ext
+
+    def _build_enrollment_json_ext(self, existing_json_ext, beneficiary, benefit_plan_code, synced_at):
+        json_ext = dict(existing_json_ext or {})
+        json_ext[self.SYNC_MARKER] = {
+            "beneficiary_id": str(beneficiary.id),
+            "benefit_plan_code": benefit_plan_code,
+            "synced_at": synced_at.isoformat(),
+            "synced_by": getattr(self.user, "username", None),
+        }
+        return json_ext
+
+    @staticmethod
+    def _get_enrollment_beneficiary_reference(beneficiary):
+        """
+        PmtEnrollment.beneficiary_id is an IntegerField, but downstream
+        beneficiaries may use UUID primary keys. Persist the integer only when
+        it fits; the canonical link is stored in enrollment.json_ext.
+        """
+        beneficiary_id = getattr(beneficiary, "id", None)
+        if isinstance(beneficiary_id, int) and -(2 ** 31) <= beneficiary_id <= (2 ** 31 - 1):
+            return beneficiary_id
+        return None
 
 
 class PmtConfigService(BaseService):
@@ -969,3 +1546,50 @@ class PmtEnrollmentService(BaseService):
         except Exception as e:
             logger.error(f"Error updating PMT Enrollment: {str(e)}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+
+class PmtGlobalFormulaService(BaseService, UpdateCheckerLogicServiceMixin):
+    """
+    Maker-checker service for the single global PMT formula.
+
+    The GraphQL mutation calls ``create_update_task`` (inherited from
+    ``UpdateCheckerLogicServiceMixin``), which records the proposed change as a
+    ``tasks_management`` Task instead of writing it. When a *second* user approves
+    that task, ``on_task_complete_service_handler(PmtGlobalFormulaService)`` (bound
+    in ``individual.signals``) runs the real ``update`` below. There is no public
+    create/delete: the formula is a provisioned singleton.
+    """
+    OBJECT_TYPE = PmtGlobalFormula
+
+    def __init__(self, user, validation_class=PmtGlobalFormulaValidation):
+        super().__init__(user, validation_class)
+
+    @register_service_signal("pmt_global_formula_service.update")
+    def update(self, obj_data):
+        return super().update(obj_data)
+
+    def get_or_create_active(self):
+        """
+        Return the active formula, provisioning one from the engine defaults on
+        first use so the maker-checker update flow always has a row to edit.
+        """
+        active = PmtGlobalFormula.get_active()
+        if active is not None:
+            return active
+
+        try:
+            from api_etl.workflows.pmt import DEFAULT_COEFFS
+            defaults = DEFAULT_COEFFS
+        except Exception:
+            defaults = {}
+
+        formula = {
+            key: defaults.get(key)
+            for key in ("cutoff", "intercept", "household_size_coef", "working_age_coef", "urban_coef")
+        }
+        formula["assets"] = dict(defaults.get("assets") or {})
+
+        obj = PmtGlobalFormula(is_active=True, formula=formula)
+        obj.save(user=self.user)
+        logger.info("Provisioned default PMT global formula %s", obj.id)
+        return obj

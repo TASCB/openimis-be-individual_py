@@ -5,3 +5,4 @@ from .group_individual_service_test import GroupIndividualServiceTest
 from .graphql_query_test import IndividualGQLQueryTest
 from .graphql_mutation_individual_test import IndividualGQLMutationTest
 from .graphql_mutation_group_test import GroupGQLMutationTest
+from .pct_auto_enrollment_service_test import PctAutoEnrollmentServiceTest

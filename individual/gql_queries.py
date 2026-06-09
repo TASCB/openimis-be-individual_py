@@ -543,6 +543,21 @@ class PmtConfigConnection(graphene.relay.Connection):
         node = PmtConfigGQLType
 
 
+class PmtGlobalFormulaGQLType(graphene.ObjectType):
+    """
+    The single, system-wide PMT formula (coefficients + cutoff). Edited through
+    the maker-checker flow, so ``has_pending_task`` tells the UI when an approval
+    is in flight and the form should be locked.
+    """
+    id = graphene.String()
+    is_active = graphene.Boolean()
+    formula = graphene.types.json.JSONString()
+    version = graphene.Int()
+    date_updated = graphene.DateTime()
+    updated_by = graphene.String()
+    has_pending_task = graphene.Boolean()
+
+
 class PmtEnrollmentGQLType(DjangoObjectType):
     """GraphQL type for PMT Enrollment."""
     uuid = graphene.String(source='uuid')

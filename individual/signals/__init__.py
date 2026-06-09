@@ -65,6 +65,12 @@ def bind_service_signals():
         on_task_complete_deduplication,
         bind_type=ServiceSignalBindType.AFTER
     )
+    from individual.pmt_service import PmtGlobalFormulaService
+    bind_service_signal(
+        'task_service.complete_task',
+        on_task_complete_service_handler(PmtGlobalFormulaService),
+        bind_type=ServiceSignalBindType.AFTER
+    )
     bind_service_signal(
         'task_service.resolve_task',
         on_task_resolve,
