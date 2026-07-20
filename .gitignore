@@ -8,3 +8,6 @@ dist
 **/.vscode
 **/*.mo
 locale/__init__.py
+
+# Ad-hoc planning/analysis docs (kept out of the module repo)
+*_PLAN.md
