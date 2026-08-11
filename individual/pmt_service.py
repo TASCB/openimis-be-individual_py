@@ -25,6 +25,7 @@ from core.services import BaseService
 from core.signals import register_service_signal
 from individual.apps import IndividualConfig
 from individual.models import Individual, Group, GroupIndividual, PmtConfig, PmtEnrollment, PmtGlobalFormula
+from individual.gql_queries import filter_by_pmt_class
 from individual.validation import PmtGlobalFormulaValidation
 from location.models import LocationManager
 from tasks_management.services import UpdateCheckerLogicServiceMixin
@@ -136,7 +137,7 @@ class PmtService(BaseService):
 
         # Filter by PMT class if provided
         if pmt_class in ["POOR", "NON_POOR"]:
-            queryset = queryset.filter(json_ext__pmt_class_household=pmt_class)
+            queryset = filter_by_pmt_class(queryset, pmt_class)
 
         # Search by group code or head name
         if search_text:
@@ -987,9 +988,8 @@ class PmtService(BaseService):
 
             # Find all groups with POOR classification (including child locations)
             poor_groups = self._apply_location_filter(
-                Group.objects.filter(
-                    is_deleted=False,
-                    json_ext__pmt_class_household="POOR",
+                filter_by_pmt_class(
+                    Group.objects.filter(is_deleted=False), "POOR"
                 ),
                 district_code=district_code,
             )
