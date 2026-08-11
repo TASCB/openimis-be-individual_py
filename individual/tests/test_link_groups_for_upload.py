@@ -74,7 +74,6 @@ class LinkGroupsForUploadTest(TestCase):
             str(upload.uuid)
         )
 
-    # ------------------------------------------------------------------
 
     def test_creates_one_group_per_code_and_links_every_member(self):
         upload, created = self._upload_with({

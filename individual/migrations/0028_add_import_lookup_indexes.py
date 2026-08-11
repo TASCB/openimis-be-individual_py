@@ -1,10 +1,5 @@
-# Group-code lookup and import dedup indexes for the import path.
-#
-# The external_id expression must match the workflow SQL character for character
-# (including the NULLIF) or the planner will not use the index.
-#
-# atomic=False: CREATE INDEX CONCURRENTLY cannot run inside a transaction. A
-# failed build leaves an INVALID index — drop it and re-run.
+# The external_id expression must match the workflow SQL exactly, NULLIF
+# included, or the planner will not use the index.
 
 from django.db import migrations
 

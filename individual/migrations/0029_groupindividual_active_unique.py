@@ -1,10 +1,5 @@
-# Partial unique index on the active (group, individual) pair.
-#
-# Applied as RunSQL rather than Meta.constraints so upstream's models.py stays
-# untouched, following 0025 and 0028.
-#
-# atomic=False: CREATE UNIQUE INDEX CONCURRENTLY cannot run inside a
-# transaction. It fails if duplicate active pairs exist — resolve them first.
+# RunSQL rather than Meta.constraints so upstream's models.py stays untouched,
+# following 0025 and 0028. Fails if duplicate active pairs exist.
 
 from django.db import migrations
 

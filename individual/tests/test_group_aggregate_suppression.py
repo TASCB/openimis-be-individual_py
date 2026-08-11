@@ -33,7 +33,6 @@ class GroupAggregateSuppressionTest(TestCase):
         gi.save(user=self.user)
         return gi
 
-    # ------------------------- flag mechanics -------------------------
 
     def test_flag_defaults_to_off(self):
         self.assertFalse(group_aggregates_suppressed())
@@ -56,7 +55,6 @@ class GroupAggregateSuppressionTest(TestCase):
             self.assertTrue(group_aggregates_suppressed())
         self.assertFalse(group_aggregates_suppressed())
 
-    # ------------------------- default behaviour is unchanged -------------------------
 
     def test_without_suppression_group_is_rebuilt_on_each_link(self):
         group = create_group(self.username)
@@ -76,7 +74,6 @@ class GroupAggregateSuppressionTest(TestCase):
         self.assertEqual(group.json_ext.get("head_id"), str(head.id))
         self.assertIn(str(member.id), group.json_ext.get("members", {}))
 
-    # ------------------------- suppression -------------------------
 
     def test_suppression_stops_the_per_save_group_rewrite(self):
         group = create_group(self.username)

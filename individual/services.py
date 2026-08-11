@@ -1837,10 +1837,7 @@ class IndividualImportService:
             IndividualDataUploadRecords,
             IndividualDataSourceUpload,
         )
-        from individual.services import (
-            GroupIndividualService,
-            GroupAndGroupIndividualAlignmentService,
-        )
+        from individual.services import GroupAndGroupIndividualAlignmentService
 
         upload = IndividualDataSourceUpload.objects.filter(
             uuid=upload_uuid, is_deleted=False
