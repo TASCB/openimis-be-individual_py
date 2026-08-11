@@ -1,3 +1,6 @@
+import threading
+from contextlib import contextmanager
+
 from django.conf import settings
 from django.db import models, transaction
 from django.db.models.signals import post_save
@@ -8,6 +11,30 @@ import core
 from core.models import HistoryModel
 from graphql import ResolveInfo
 from location.models import Location, LocationManager
+
+
+_group_aggregate_state = threading.local()
+
+
+def group_aggregates_suppressed():
+    return getattr(_group_aggregate_state, "suppressed", False)
+
+
+@contextmanager
+def suppress_group_aggregate_updates():
+    """
+    Skip the per-save group aggregate rebuild for the duration of this block.
+
+    For bulk callers that rebuild once per group themselves afterwards; the
+    rebuild is not optional, or group.json_ext is left stale. Thread-local and
+    default-off, so interactive edits are unaffected.
+    """
+    previous = getattr(_group_aggregate_state, "suppressed", False)
+    _group_aggregate_state.suppressed = True
+    try:
+        yield
+    finally:
+        _group_aggregate_state.suppressed = previous
 
 
 

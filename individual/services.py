@@ -27,6 +27,8 @@ from individual.models import (
     Group,
     IndividualDataUploadRecords,
     IndividualDataSourceUpload,
+    group_aggregates_suppressed,
+    suppress_group_aggregate_updates,
 )
 from individual.utils import (
     load_dataframe,
@@ -535,13 +537,19 @@ class GroupAndGroupIndividualAlignmentService:
         if recipient_type == GroupIndividual.RecipientType.PRIMARY:
             self._change_primary(group_individual_id, group_id)
 
-    def update_json_ext_for_group(self, group):
+    def update_json_ext_for_group(self, group, force=False):
         """
         This method ensures that json_ext of a group is up-to-date with its roles and members.
         Also (non-breaking enhancement): if a HEAD exists, mirror household PMT to the group
         as pmt_score_household / pmt_class_household.
+
+        Bulk callers may suppress the per-save rebuild and call this once per
+        group afterwards with force=True.
         """
-        group_individuals = GroupIndividual.objects.filter(
+        if not force and group_aggregates_suppressed():
+            return
+
+        group_individuals = GroupIndividual.objects.select_related("individual").filter(
             group_id=group.id, is_deleted=False
         )
         head = group_individuals.filter(role=GroupIndividual.Role.HEAD).first()
@@ -1825,7 +1833,8 @@ class IndividualImportService:
         updated_links = 0
         touched_groups = set()
 
-        with transaction.atomic():
+        # The loop at the end of this block rebuilds each touched group once.
+        with transaction.atomic(), suppress_group_aggregate_updates():
             for ind in inds:
                 # Resolve group code from top-level or json_ext fallback
                 group_code = getattr(ind, group_col, None)
@@ -1936,13 +1945,17 @@ class IndividualImportService:
                 except Exception:
                     pass
 
-            # Refresh group.json_ext aggregates once per touched group
+            # force=True: the per-save rebuild is suppressed above, so this is the
+            # only thing maintaining group.json_ext and must not fail silently.
             for gid in touched_groups:
                 try:
                     g = Group.objects.get(id=gid)
-                    aligner.update_json_ext_for_group(g)
+                    aligner.update_json_ext_for_group(g, force=True)
                 except Exception:
-                    pass
+                    logger.exception(
+                        "Failed to refresh group.json_ext aggregates for group %s; "
+                        "its members/head/PMT summary may be stale.", gid
+                    )
 
         return {
             "success": True,
