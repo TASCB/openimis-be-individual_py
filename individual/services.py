@@ -6,6 +6,7 @@ import concurrent.futures
 import math
 import inspect
 import importlib
+from collections import OrderedDict
 from pandas import DataFrame
 from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.db import transaction
@@ -1833,120 +1834,151 @@ class IndividualImportService:
         updated_links = 0
         touched_groups = set()
 
-        # The loop at the end of this block rebuilds each touched group once.
-        with transaction.atomic(), suppress_group_aggregate_updates():
-            for ind in inds:
-                # Resolve group code from top-level or json_ext fallback
-                group_code = getattr(ind, group_col, None)
-                if not group_code:
-                    jx = ind.json_ext or {}
-                    group_code = jx.get(group_col) or jx.get("group_code")
-                if not group_code:
-                    continue
+        # `inds` is already head-first, so each household list preserves that order.
+        households = OrderedDict()
+        for ind in inds:
+            group_code = getattr(ind, group_col, None)
+            if not group_code:
+                jx = ind.json_ext or {}
+                group_code = jx.get(group_col) or jx.get("group_code")
+            if not group_code:
+                continue
+            households.setdefault(str(group_code), []).append(ind)
 
-                grp = Group.objects.filter(code=group_code, is_deleted=False).first()
-                if not grp:
+        if not households:
+            return {
+                "success": True,
+                "group_column": group_col,
+                "created_groups": 0,
+                "created_links": 0,
+                "updated_links": 0,
+                "groups_touched": 0,
+            }
+
+        with transaction.atomic(), suppress_group_aggregate_updates():
+            groups_by_code = {
+                g.code: g
+                for g in Group.objects.filter(
+                    code__in=list(households.keys()), is_deleted=False
+                )
+            }
+            for group_code in households:
+                if group_code not in groups_by_code:
                     grp = Group(code=group_code, json_ext={})
                     grp.save(user=self.user)
+                    groups_by_code[group_code] = grp
                     created_groups += 1
+
+            group_ids = [g.id for g in groups_by_code.values()]
+            existing_links = {
+                (gi.group_id, gi.individual_id): gi
+                for gi in GroupIndividual.objects.filter(
+                    group_id__in=group_ids, is_deleted=False
+                )
+            }
+            groups_with_head = {
+                gid
+                for gid in GroupIndividual.objects.filter(
+                    group_id__in=group_ids,
+                    role=GroupIndividual.Role.HEAD,
+                    is_deleted=False,
+                ).values_list("group_id", flat=True)
+            }
+
+            for group_code, members in households.items():
+                grp = groups_by_code[group_code]
                 touched_groups.add(grp.id)
 
-                # Role / recipient inference from individual's json_ext.
-                # Keep this aligned with api_etl's relationship-to-head mapping.
-                jx = ind.json_ext or {}
-                role_code = str(
-                    self._json_ext_lookup(
-                        jx,
-                        "individual_role_code",
-                        "rel_to_hhh",
-                        "relationship_to_head",
+                for ind in members:
+                    jx = ind.json_ext or {}
+                    role_code = str(
+                        self._json_ext_lookup(
+                            jx,
+                            "individual_role_code",
+                            "rel_to_hhh",
+                            "relationship_to_head",
+                        )
+                        or ""
+                    ).strip()
+                    hhrep_code = str(self._json_ext_lookup(jx, "hhrep") or "").strip()
+
+                    desired_role = self._group_individual_role_from_json_ext(jx)
+                    desired_recipient = (
+                        GroupIndividual.RecipientType.PRIMARY
+                        if (hhrep_code and hhrep_code == role_code)
+                        else None
                     )
-                    or ""
-                ).strip()
-                hhrep_code = str(self._json_ext_lookup(jx, "hhrep") or "").strip()
 
-                desired_role = self._group_individual_role_from_json_ext(jx)
-                desired_recipient = (
-                    GroupIndividual.RecipientType.PRIMARY
-                    if (hhrep_code and hhrep_code == role_code)
-                    else None
-                )
-
-                # Align locations BEFORE linking (mirrors your earlier logic)
-                has_head = GroupIndividual.objects.filter(
-                    group=grp, role=GroupIndividual.Role.HEAD, is_deleted=False
-                ).exists()
-                role_for_alignment = (
-                    desired_role
-                    if (desired_role == GroupIndividual.Role.HEAD or not has_head)
-                    else None
-                )
-                try:
-                    aligner.ensure_location_consistent(grp, ind, role_for_alignment)
-                except Exception:
-                    # non-fatal alignment error
-                    pass
-
-                gi = GroupIndividual.objects.filter(
-                    group=grp, individual=ind, is_deleted=False
-                ).first()
-                if not gi:
-                    GroupIndividualService(self.user).create(
-                        {
-                            "group_id": str(grp.id),
-                            "individual_id": str(ind.id),
-                            "role": desired_role,
-                            "recipient_type": desired_recipient,
-                        }
+                    has_head = grp.id in groups_with_head
+                    role_for_alignment = (
+                        desired_role
+                        if (desired_role == GroupIndividual.Role.HEAD or not has_head)
+                        else None
                     )
-                    created_links += 1
-                else:
-                    changed = False
-                    if gi.role != desired_role:
-                        gi.role = desired_role
-                        changed = True
-                    if gi.recipient_type != desired_recipient:
-                        gi.recipient_type = desired_recipient
-                        changed = True
-                    if changed:
-                        gi.save(user=self.user)
-                        updated_links += 1
+                    try:
+                        aligner.ensure_location_consistent(grp, ind, role_for_alignment)
+                    except Exception:
+                        # non-fatal alignment error
+                        pass
 
-                # Copy PMT from HEAD to group json_ext (optional but useful)
-                try:
-                    if desired_role == GroupIndividual.Role.HEAD:
-                        pmt_score = jx.get("pmt_score")
-                        pmt_class = jx.get("pmt_class")
-                        pmt_cutoff_used = jx.get("pmt_cutoff_used")
-                        if pmt_score is not None or pmt_class is not None or pmt_cutoff_used is not None:
-                            upd = False
-                            if grp.json_ext is None:
-                                grp.json_ext = {}
-                            if (
-                                pmt_score is not None
-                                and grp.json_ext.get("pmt_score_household") != pmt_score
-                            ):
-                                grp.json_ext["pmt_score_household"] = pmt_score
-                                upd = True
-                            if (
-                                pmt_class is not None
-                                and grp.json_ext.get("pmt_class_household") != pmt_class
-                            ):
-                                grp.json_ext["pmt_class_household"] = pmt_class
-                                upd = True
-                            if (
-                                pmt_cutoff_used is not None
-                                and grp.json_ext.get("pmt_cutoff_used") != pmt_cutoff_used
-                            ):
-                                grp.json_ext["pmt_cutoff_used"] = pmt_cutoff_used
-                                upd = True
-                            if upd:
-                                grp.save(update_fields=["json_ext"], user=self.user)
-                except Exception:
-                    pass
+                    gi = existing_links.get((grp.id, ind.id))
+                    if not gi:
+                        GroupIndividualService(self.user).create(
+                            {
+                                "group_id": str(grp.id),
+                                "individual_id": str(ind.id),
+                                "role": desired_role,
+                                "recipient_type": desired_recipient,
+                            }
+                        )
+                        created_links += 1
+                        if desired_role == GroupIndividual.Role.HEAD:
+                            groups_with_head.add(grp.id)
+                    else:
+                        changed = False
+                        if gi.role != desired_role:
+                            gi.role = desired_role
+                            changed = True
+                        if gi.recipient_type != desired_recipient:
+                            gi.recipient_type = desired_recipient
+                            changed = True
+                        if changed:
+                            gi.save(user=self.user)
+                            updated_links += 1
 
-            # force=True: the per-save rebuild is suppressed above, so this is the
-            # only thing maintaining group.json_ext and must not fail silently.
+                    try:
+                        if desired_role == GroupIndividual.Role.HEAD:
+                            pmt_score = jx.get("pmt_score")
+                            pmt_class = jx.get("pmt_class")
+                            pmt_cutoff_used = jx.get("pmt_cutoff_used")
+                            if pmt_score is not None or pmt_class is not None or pmt_cutoff_used is not None:
+                                upd = False
+                                if grp.json_ext is None:
+                                    grp.json_ext = {}
+                                if (
+                                    pmt_score is not None
+                                    and grp.json_ext.get("pmt_score_household") != pmt_score
+                                ):
+                                    grp.json_ext["pmt_score_household"] = pmt_score
+                                    upd = True
+                                if (
+                                    pmt_class is not None
+                                    and grp.json_ext.get("pmt_class_household") != pmt_class
+                                ):
+                                    grp.json_ext["pmt_class_household"] = pmt_class
+                                    upd = True
+                                if (
+                                    pmt_cutoff_used is not None
+                                    and grp.json_ext.get("pmt_cutoff_used") != pmt_cutoff_used
+                                ):
+                                    grp.json_ext["pmt_cutoff_used"] = pmt_cutoff_used
+                                    upd = True
+                                if upd:
+                                    grp.save(update_fields=["json_ext"], user=self.user)
+                    except Exception:
+                        pass
+
+            # force=True: the per-save rebuild is suppressed above.
             for gid in touched_groups:
                 try:
                     g = Group.objects.get(id=gid)
