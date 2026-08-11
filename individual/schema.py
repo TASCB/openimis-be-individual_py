@@ -8,7 +8,7 @@ import django_filters
 import pandas as pd
 
 from django.contrib.auth.models import AnonymousUser
-from django.db.models import Q, OuterRef, Subquery
+from django.db.models import Q, OuterRef, Subquery, Exists
 
 from core.custom_filters import CustomFilterWizardStorage
 from core.gql.export_mixin import ExportableQueryMixin
@@ -68,6 +68,8 @@ from individual.gql_queries import (
     PmtGlobalFormulaGQLType,
     apply_non_consented_filter,
     non_consented_marker_q,
+    filter_by_pmt_class,
+    prefetch_group_heads,
 )
 from individual.models import (
     Individual,
@@ -343,18 +345,21 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         # ---- Group-level PMT eligibility filtering for Eligible Members page ----
         group_pmt_eligible = kwargs.get("groupPmtEligible", None)
         if group_pmt_eligible is not None:
-            if group_pmt_eligible is True:
-                # Show only individuals whose group is PMT-eligible (POOR class)
-                filters.append(
-                    Q(groupindividuals__group__json_ext__pmt_class_household="POOR",
-                      groupindividuals__is_deleted=False)
+            wanted = "POOR" if group_pmt_eligible is True else "NON_POOR"
+            eligible_groups = filter_by_pmt_class(
+                Group.objects.filter(is_deleted=False), wanted
+            ).values("id")
+            filters.append(
+                Q(
+                    Exists(
+                        GroupIndividual.objects.filter(
+                            individual_id=OuterRef("pk"),
+                            is_deleted=False,
+                            group_id__in=eligible_groups,
+                        )
+                    )
                 )
-            else:
-                # Show only individuals whose group is NOT PMT-eligible (NON_POOR class)
-                filters.append(
-                    Q(groupindividuals__group__json_ext__pmt_class_household="NON_POOR",
-                      groupindividuals__is_deleted=False)
-                )
+            )
 
         # ---- Group-level consent filtering for Eligible Members page ----
         group_is_non_consented = kwargs.get("groupIsNonConsented", None)
@@ -659,26 +664,24 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
                 Q(json_ext__pmt_score_household__lt=pmt_score_household_lt)
             )
 
+        pmt_class_wanted = None
+
         pmt_class_household = kwargs.get("pmtClassHousehold")
         if pmt_class_household:
             pmt_filter_requested = True
-            filters.append(
-                Q(json_ext__pmt_class_household=pmt_class_household)
-            )
+            pmt_class_wanted = pmt_class_household
 
         pmt_eligible = kwargs.get("pmtEligible")
         if pmt_eligible is True:
             pmt_filter_requested = True
-            filters.append(
-                Q(json_ext__pmt_class_household="POOR")
-            )
+            pmt_class_wanted = "POOR"
         elif pmt_eligible is False:
             pmt_filter_requested = True
-            filters.append(
-                Q(json_ext__pmt_class_household="NON_POOR")
-            )
+            pmt_class_wanted = "NON_POOR"
 
-        query = GroupGQLType.get_queryset(None, info)
+        query = prefetch_group_heads(GroupGQLType.get_queryset(None, info))
+        if pmt_class_wanted is not None:
+            query = filter_by_pmt_class(query, pmt_class_wanted)
         query = query.filter(*filters)
 
         custom_filters = kwargs.get("customFilters", None)

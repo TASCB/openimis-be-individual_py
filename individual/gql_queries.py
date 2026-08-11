@@ -55,6 +55,45 @@ def non_consented_marker_q(individual_json_path="json_ext"):
     )
 
 
+PMT_CLASS_ANNOTATION = "pmt_class_household_text"
+HEAD_PREFETCH_ATTR = "head_links"
+
+
+def prefetch_group_heads(queryset):
+    """
+    One query for every rendered group's HEAD instead of one per row.
+    resolve_head reads the prefetched list when present.
+    """
+    from django.db.models import Prefetch
+
+    return queryset.prefetch_related(
+        Prefetch(
+            "groupindividuals",
+            queryset=GroupIndividual.objects.filter(
+                role=GroupIndividual.Role.HEAD, is_deleted=False
+            ).select_related("individual"),
+            to_attr=HEAD_PREFETCH_ATTR,
+        )
+    )
+
+
+def annotate_pmt_class(queryset):
+    """
+    Expose pmt_class_household as text so filters compile to ->> and can use
+    idx_individual_group_pmt_class. Filtering the json field directly compiles
+    to -> and sequential-scans the table.
+    """
+    return queryset.annotate(
+        **{PMT_CLASS_ANNOTATION: KeyTextTransform("pmt_class_household", "json_ext")}
+    )
+
+
+def filter_by_pmt_class(queryset, pmt_class):
+    return annotate_pmt_class(queryset).filter(
+        **{PMT_CLASS_ANNOTATION: pmt_class}
+    )
+
+
 def apply_non_consented_filter(queryset, value=True):
     queryset = queryset.annotate(
         consent_res_text=KeyTextTransform("consent_res", "json_ext")
@@ -286,6 +325,9 @@ class GroupGQLType(DjangoObjectType):
         - the Non-Consented page uses its own dedicated fetch/query path
         - this resolver should only return the HEAD for groups already returned
         """
+        prefetched = getattr(self, HEAD_PREFETCH_ATTR, None)
+        if prefetched is not None:
+            return prefetched[0].individual if prefetched else None
         return Individual.objects.filter(
             groupindividuals__group__id=self.id,
             groupindividuals__role=GroupIndividual.Role.HEAD,
