@@ -187,3 +187,58 @@ class LinkGroupsForUploadTest(TestCase):
             1,
             "exactly one HEAD per household",
         )
+
+    def test_only_one_head_when_several_members_claim_it(self):
+        upload, _ = self._upload_with({
+            "G9": [("1", "1", 1.0), ("1", "0", None), ("3", "0", None)]
+        })
+        self._run(upload)
+
+        grp = Group.objects.get(code="G9", is_deleted=False)
+        self.assertEqual(
+            GroupIndividual.objects.filter(
+                group=grp, role=GroupIndividual.Role.HEAD, is_deleted=False
+            ).count(),
+            1,
+        )
+
+    def test_primary_promoted_when_household_has_none(self):
+        upload, _ = self._upload_with({"GA": [("3", "0", None), ("3", "0", None)]})
+        self._run(upload)
+
+        grp = Group.objects.get(code="GA", is_deleted=False)
+        self.assertEqual(
+            GroupIndividual.objects.filter(
+                group=grp,
+                recipient_type=GroupIndividual.RecipientType.PRIMARY,
+                is_deleted=False,
+            ).count(),
+            1,
+        )
+
+    def test_only_one_primary_per_household(self):
+        upload, _ = self._upload_with({
+            "GB": [("1", "1", 2.0), ("3", "3", None), ("3", "0", None)]
+        })
+        self._run(upload)
+
+        grp = Group.objects.get(code="GB", is_deleted=False)
+        self.assertEqual(
+            GroupIndividual.objects.filter(
+                group=grp,
+                recipient_type=GroupIndividual.RecipientType.PRIMARY,
+                is_deleted=False,
+            ).count(),
+            1,
+        )
+
+    def test_history_written_for_bulk_created_links(self):
+        upload, _ = self._upload_with({"GC": [("1", "1", 4.0), ("3", "0", None)]})
+        self._run(upload)
+
+        grp = Group.objects.get(code="GC", is_deleted=False)
+        self.assertGreaterEqual(
+            GroupIndividual.history.filter(group_id=grp.id).count(),
+            2,
+            "bulk-created links must still write history rows",
+        )

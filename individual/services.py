@@ -7,6 +7,9 @@ import math
 import inspect
 import importlib
 from collections import OrderedDict
+from datetime import datetime as py_datetime
+
+from simple_history.utils import bulk_create_with_history, bulk_update_with_history
 from pandas import DataFrame
 from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.db import transaction
@@ -1771,6 +1774,53 @@ class IndividualImportService:
             logger.exception("Workflow crashed for upload %s", upload.uuid)
             return upload
 
+    @staticmethod
+    def _normalize_household_roles(
+        group, household_links, existing_links, changed_links, new_links
+    ):
+        """
+        In-memory equivalent of the per-save handlers: at most one HEAD and one
+        PRIMARY per household, and a PRIMARY promoted when the household has none.
+        """
+        from individual.models import GroupIndividual
+
+        links = [
+            gi
+            for (gid, _iid), gi in existing_links.items()
+            if gid == group.id
+        ]
+        if not links:
+            return
+
+        def _mark(gi):
+            if gi not in new_links:
+                changed_links[gi.id] = gi
+
+        heads = [gi for gi in links if gi.role == GroupIndividual.Role.HEAD]
+        if len(heads) > 1:
+            for gi in heads[:-1]:
+                gi.role = None
+                _mark(gi)
+            heads = heads[-1:]
+
+        primaries = [
+            gi
+            for gi in links
+            if gi.recipient_type == GroupIndividual.RecipientType.PRIMARY
+        ]
+        if len(primaries) > 1:
+            for gi in primaries[:-1]:
+                gi.recipient_type = None
+                _mark(gi)
+            primaries = primaries[-1:]
+
+        if not primaries:
+            new_primary = links[0]
+            new_primary.recipient_type = GroupIndividual.RecipientType.PRIMARY
+            if not heads:
+                new_primary.role = GroupIndividual.Role.HEAD
+            _mark(new_primary)
+
     def link_groups_for_upload_uuid(self, upload_uuid: str) -> dict:
         """
         Create/align Groups and GroupIndividuals for all Individuals created by this upload.
@@ -1885,9 +1935,16 @@ class IndividualImportService:
                 ).values_list("group_id", flat=True)
             }
 
+            now = py_datetime.now()
+            new_links = []
+            changed_links = {}
+            individuals_to_update = {}
+            groups_to_save = {}
+
             for group_code, members in households.items():
                 grp = groups_by_code[group_code]
                 touched_groups.add(grp.id)
+                household_links = []
 
                 for ind in members:
                     jx = ind.json_ext or {}
@@ -1915,26 +1972,40 @@ class IndividualImportService:
                         if (desired_role == GroupIndividual.Role.HEAD or not has_head)
                         else None
                     )
-                    try:
-                        aligner.ensure_location_consistent(grp, ind, role_for_alignment)
-                    except Exception:
-                        # non-fatal alignment error
-                        pass
+                    if grp.location_id != ind.location_id:
+                        if (
+                            role_for_alignment == GroupIndividual.Role.HEAD
+                            and grp.location_id is None
+                        ):
+                            grp.location_id = ind.location_id
+                            groups_to_save[grp.id] = grp
+                        else:
+                            ind.location_id = grp.location_id
+                            individuals_to_update[ind.id] = ind
 
                     gi = existing_links.get((grp.id, ind.id))
                     if not gi:
-                        GroupIndividualService(self.user).create(
-                            {
-                                "group_id": str(grp.id),
-                                "individual_id": str(ind.id),
-                                "role": desired_role,
-                                "recipient_type": desired_recipient,
-                            }
+                        gi = GroupIndividual(
+                            id=uuid.uuid4(),
+                            group=grp,
+                            individual=ind,
+                            role=desired_role,
+                            recipient_type=desired_recipient,
+                            json_ext={},
+                            user_created=self.user,
+                            user_updated=self.user,
+                            date_created=now,
+                            date_updated=now,
+                            version=1,
                         )
+                        existing_links[(grp.id, ind.id)] = gi
+                        new_links.append(gi)
+                        household_links.append(gi)
                         created_links += 1
                         if desired_role == GroupIndividual.Role.HEAD:
                             groups_with_head.add(grp.id)
                     else:
+                        household_links.append(gi)
                         changed = False
                         if gi.role != desired_role:
                             gi.role = desired_role
@@ -1943,7 +2014,7 @@ class IndividualImportService:
                             gi.recipient_type = desired_recipient
                             changed = True
                         if changed:
-                            gi.save(user=self.user)
+                            changed_links[gi.id] = gi
                             updated_links += 1
 
                     try:
@@ -1977,6 +2048,34 @@ class IndividualImportService:
                                     grp.save(update_fields=["json_ext"], user=self.user)
                     except Exception:
                         pass
+
+                self._normalize_household_roles(
+                    grp, household_links, existing_links, changed_links, new_links
+                )
+
+            if individuals_to_update:
+                bulk_update_with_history(
+                    list(individuals_to_update.values()),
+                    Individual,
+                    ["location_id"],
+                    batch_size=1000,
+                    default_user=self.user,
+                )
+            for g in groups_to_save.values():
+                g.save(user=self.user)
+            if new_links:
+                bulk_create_with_history(
+                    new_links, GroupIndividual, batch_size=1000, default_user=self.user
+                )
+            stored = [gi for gi in changed_links.values() if gi not in new_links]
+            if stored:
+                bulk_update_with_history(
+                    stored,
+                    GroupIndividual,
+                    ["role", "recipient_type"],
+                    batch_size=1000,
+                    default_user=self.user,
+                )
 
             # force=True: the per-save rebuild is suppressed above.
             for gid in touched_groups:
