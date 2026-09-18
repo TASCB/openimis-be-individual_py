@@ -207,6 +207,10 @@ class GroupIndividual(HistoryModel):
     )
     role = models.CharField(max_length=255, choices=Role.choices, null=True, blank=True)
     recipient_type = models.CharField(max_length=255, choices=RecipientType.choices, null=True, blank=True)
+    # False = deactivated with a recorded reason (case_management owns the reason and history).
+    # Distinct from is_deleted, which means the membership was removed outright.
+    # Mirrors HOUSEHOLD_MEMBERS.isActive in the mobile app.
+    is_active = models.BooleanField(default=True)
 
     json_ext = models.JSONField(db_column="Json_ext", blank=True, default=dict)
 
