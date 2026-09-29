@@ -136,20 +136,17 @@ def validate_group_task_pending(data):
     content_type_group = ContentType.objects.get_for_model(Group)
     groupindividual_ids = list(GroupIndividual.objects.filter(group_id=group_id).values_list('id', flat=True))
 
-    is_groupindividual_task = Task.objects.filter(
+    # Name the change that blocks, so the officer knows what to chase rather than a group id.
+    blocking = Task.objects.filter(
         Q(status=Task.Status.RECEIVED) | Q(status=Task.Status.ACCEPTED),
-        entity_type=content_type_groupindividual,
-        entity_id__in=groupindividual_ids,
-    ).exists()
+        Q(entity_type=content_type_groupindividual, entity_id__in=[str(i) for i in groupindividual_ids])
+        | Q(entity_type=content_type_group, entity_id=str(group_id)),
+    ).select_related('user_created').order_by('date_created').first()
 
-    is_group_task = Task.objects.filter(
-        Q(status=Task.Status.RECEIVED) | Q(status=Task.Status.ACCEPTED),
-        entity_type=content_type_group,
-        entity_id=group_id,
-    ).exists()
-
-    if is_groupindividual_task or is_group_task:
+    if blocking:
+        submitter = getattr(blocking.user_created, 'username', None) or '?'
+        submitted = blocking.date_created.strftime('%Y-%m-%d') if blocking.date_created else '?'
         return [{"message": _("individual.validation.validate_group_task_pending") % {
-            'group_id': group_id
+            'group_id': group_id, 'date': submitted, 'user': submitter,
         }}]
     return []

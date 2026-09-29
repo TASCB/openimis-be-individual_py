@@ -20,23 +20,23 @@ msgstr ""
 
 #: individual/validation.py:23
 msgid "individual.validation.validate_update_group_individuals.extra_fields"
-msgstr "Invalid field(s) found: %(fields)"
+msgstr "Invalid field(s) found: %(fields)s"
 
 #: individual/validation.py:28
 msgid "individual.validation.validate_update_group_individuals.missing_fields"
-msgstr "Missing field(s) found: %(fields)"
+msgstr "Missing field(s) found: %(fields)s"
 
 msgid "individual.validation.validate_group_task_pending"
-msgstr "There is one task pending for the group %(group_id)."
+msgstr "This household has a change waiting for approval (submitted %(date)s by %(user)s). It must be approved or rejected before another change can be made."
 
 msgid "individual.validation.validate_create_group_and_individual.group_individual_does_not_exist"
 msgstr "GroupIndividual does not exist."
 
 msgid "individual.validation.validate_create_group_individuals.wrong_individual_ids"
-msgstr "Invalid Individual ids %(invalid_ids)"
+msgstr "Invalid Individual ids %(invalid_ids)s"
 
 msgid "individual.validation.validate_undo_delete.individual_not_deleted"
-msgstr "Individual %(id) is not deleted."
+msgstr "Individual %(id)s is not deleted."
 
 msgid "individual.validation.check_if_group_id"
 msgstr "Missing group_id."

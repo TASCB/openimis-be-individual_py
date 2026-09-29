@@ -316,7 +316,10 @@ class UpdateGroupMutation(BaseHistoryModelUpdateMutationMixin, BaseMutation):
             data.pop('client_mutation_label')
 
         service = GroupService(user)
-        result = service.update(data)
+        if IndividualConfig.enable_maker_checker_for_group_update:
+            result = service.create_update_task(data)
+        else:
+            result = service.update(data)
         return result if not result['success'] else None
 
     class Input(UpdateGroupInputType):

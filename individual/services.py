@@ -12,6 +12,7 @@ from datetime import datetime as py_datetime
 from simple_history.utils import bulk_create_with_history, bulk_update_with_history
 from pandas import DataFrame
 from django.core.files.uploadedfile import InMemoryUploadedFile
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
 
 from calculation.services import get_calculation_object
@@ -24,6 +25,7 @@ from django.apps import apps
 from django.utils.translation import gettext as _
 from django.db.models import Q, OuterRef, Subquery, Count
 from individual.apps import IndividualConfig
+from individual.relationship_roles import role_for_relationship
 from individual.models import (
     Individual,
     IndividualDataSource,
@@ -344,6 +346,23 @@ class GroupService(
             return output_exception(
                 model_name=self.OBJECT_TYPE.__name__, method="update", exception=exc
             )
+
+    def _adjust_update_task_data(self, entity, obj_data):
+        # individuals_data is not a Group attribute, so the default payload builder cannot read
+        # its current value; record the current members instead.
+        individuals_data = obj_data.pop("individuals_data", None)
+        payload = super()._adjust_update_task_data(entity, obj_data)
+        if individuals_data is not None:
+            payload["incoming_data"]["individuals_data"] = json.loads(
+                json.dumps(individuals_data, cls=DjangoJSONEncoder)
+            )
+            payload["current_data"]["individuals_data"] = [
+                {"individual_id": str(individual_id)}
+                for individual_id in GroupIndividual.objects.filter(
+                    group=entity, is_deleted=False
+                ).values_list("individual_id", flat=True)
+            ]
+        return payload
 
     @register_service_signal("group_service.delete")
     def delete(self, obj_data):
@@ -1248,42 +1267,8 @@ class IndividualImportService:
 
     @classmethod
     def _group_individual_role_from_relationship(cls, relationship_to_head, gender):
-        relationship_code = str(relationship_to_head or "").strip()
-        normalized_gender = str(gender or "").strip().upper()
-
-        if not relationship_code:
-            return None
-        if relationship_code == "1":
-            return GroupIndividual.Role.HEAD
-        if relationship_code in ("2", "12"):
-            return GroupIndividual.Role.SPOUSE
-        if relationship_code in ("3", "4"):
-            if normalized_gender == "M":
-                return GroupIndividual.Role.SON
-            if normalized_gender == "F":
-                return GroupIndividual.Role.DAUGHTER
-            return GroupIndividual.Role.OTHER_RELATIVE
-        if relationship_code == "5":
-            if normalized_gender == "M":
-                return GroupIndividual.Role.BROTHER
-            if normalized_gender == "F":
-                return GroupIndividual.Role.SISTER
-            return GroupIndividual.Role.OTHER_RELATIVE
-        if relationship_code == "6":
-            if normalized_gender == "M":
-                return GroupIndividual.Role.GRANDSON
-            if normalized_gender == "F":
-                return GroupIndividual.Role.GRANDDAUGHTER
-            return GroupIndividual.Role.OTHER_RELATIVE
-        if relationship_code == "7":
-            if normalized_gender == "M":
-                return GroupIndividual.Role.FATHER
-            if normalized_gender == "F":
-                return GroupIndividual.Role.MOTHER
-            return GroupIndividual.Role.OTHER_RELATIVE
-        if relationship_code == "14":
-            return GroupIndividual.Role.NOT_RELATED
-        return GroupIndividual.Role.OTHER_RELATIVE
+        role = role_for_relationship(relationship_to_head, gender)
+        return GroupIndividual.Role(role) if role else None
 
     @classmethod
     def _group_individual_role_from_json_ext(cls, json_ext):
