@@ -55,8 +55,32 @@ def non_consented_marker_q(individual_json_path="json_ext"):
     )
 
 
+def non_consented_household_q(group_ref="pk"):
+    from django.db.models import Exists, OuterRef
+    from individual.models import GroupIndividual
+
+    return Q(Exists(GroupIndividual.objects.filter(
+        group_id=OuterRef(group_ref), is_deleted=False, role=GroupIndividual.Role.HEAD,
+    ).filter(non_consented_marker_q("individual__json_ext"))))
+
+
+def pct_enrolled_q(group_ref="pk"):
+    from django.db.models import Exists, OuterRef
+    from social_protection.models import GroupBeneficiary
+    from individual.apps import IndividualConfig
+
+    return Q(Exists(GroupBeneficiary.objects.filter(
+        group_id=OuterRef(group_ref),
+        is_deleted=False,
+        status=IndividualConfig.pct_group_beneficiary_status or "ACTIVE",
+        benefit_plan__code=IndividualConfig.pct_benefit_plan_code,
+        benefit_plan__is_deleted=False,
+    )))
+
+
 PMT_CLASS_ANNOTATION = "pmt_class_household_text"
 HEAD_PREFETCH_ATTR = "head_links"
+MEMBERS_PREFETCH_ATTR = "member_links"
 
 
 def prefetch_group_heads(queryset):
@@ -73,7 +97,12 @@ def prefetch_group_heads(queryset):
                 role=GroupIndividual.Role.HEAD, is_deleted=False
             ).select_related("individual"),
             to_attr=HEAD_PREFETCH_ATTR,
-        )
+        ),
+        Prefetch(
+            "groupindividuals",
+            queryset=GroupIndividual.objects.filter(is_deleted=False).only("id", "group_id"),
+            to_attr=MEMBERS_PREFETCH_ATTR,
+        ),
     )
 
 
@@ -145,6 +174,13 @@ class IndividualGQLType(DjangoObjectType):
     tf4_no = graphene.String(name="tf4No")
     interview_key = graphene.String(name="interviewKey")
     interview_results_no = graphene.String(name="interviewResultsNo")
+    gender = graphene.String()
+    phone_number = graphene.String()
+    nin = graphene.String()
+    prem_number = graphene.String()
+    is_head = graphene.Boolean()
+    is_hhrep = graphene.Boolean()
+    status = graphene.String(description="PCT enrolment status of the member's household")
 
     class Meta:
         model = Individual
@@ -237,6 +273,57 @@ class IndividualGQLType(DjangoObjectType):
 
         return str(v).strip().zfill(2) if v not in (None, "") else None
 
+    def _member_value(self, info, *keys):
+        if not _have_permissions(info.context.user, IndividualConfig.gql_individual_search_perms):
+            return None
+        ext = getattr(self, "json_ext", None) or {}
+        for source in (ext, _json_ext_payload(ext), _json_ext_raw(ext)):
+            for key in keys:
+                v = source.get(key)
+                if v not in (None, ""):
+                    return str(v).strip()
+        return None
+
+    def _household_link(self):
+        if not hasattr(self, "_household_link_cache"):
+            self._household_link_cache = (
+                GroupIndividual.objects.filter(individual_id=self.id, is_deleted=False, group__is_deleted=False)
+                .select_related("group").first()
+            )
+        return self._household_link_cache
+
+    def resolve_gender(self, info):
+        v = IndividualGQLType._member_value(self, info, "gender", "sex")
+        return {"1": "Male", "2": "Female", "M": "Male", "F": "Female"}.get((v or "").upper(), v)
+
+    def resolve_phone_number(self, info):
+        return IndividualGQLType._member_value(self, info, "phone", "phone_number", "hh_mb_phone_No", "phone_no_oz", "phone_no2")
+
+    def resolve_nin(self, info):
+        return IndividualGQLType._member_value(self, info, "nin", "NIN", "Id_NIN")
+
+    def resolve_prem_number(self, info):
+        return IndividualGQLType._member_value(self, info, "premno", "prem_number", "prem_no", "PREMNO")
+
+    def resolve_is_head(self, info):
+        link = IndividualGQLType._household_link(self)
+        return bool(link and link.role == GroupIndividual.Role.HEAD)
+
+    def resolve_is_hhrep(self, info):
+        link = IndividualGQLType._household_link(self)
+        return bool(link and link.recipient_type == GroupIndividual.RecipientType.PRIMARY)
+
+    def resolve_status(self, info):
+        link = IndividualGQLType._household_link(self)
+        if not link:
+            return None
+        from social_protection.models import GroupBeneficiary
+
+        beneficiary = GroupBeneficiary.objects.filter(
+            group_id=link.group_id, is_deleted=False,
+            benefit_plan__code=IndividualConfig.pct_benefit_plan_code, benefit_plan__is_deleted=False,
+        ).only("status").first()
+        return beneficiary.status if beneficiary else "NOT_ENROLLED"
 
     @classmethod
     def get_queryset(cls, queryset, info):
@@ -316,6 +403,13 @@ class GroupGQLType(DjangoObjectType):
     head = graphene.Field(IndividualGQLType)
     pmt_score_household = graphene.Float(name="pmtScoreHousehold")
     pmt_class_household = graphene.String(name="pmtClassHousehold")
+    member_count = graphene.Int(description="Active (not deleted) members of the household")
+
+    def resolve_member_count(self, info):
+        prefetched = getattr(self, MEMBERS_PREFETCH_ATTR, None)
+        if prefetched is not None:
+            return len(prefetched)
+        return GroupIndividual.objects.filter(group_id=self.id, is_deleted=False).count()
 
     def resolve_head(self, info):
         """
@@ -682,6 +776,9 @@ class PmtHouseholdEnrollmentType(graphene.ObjectType):
     number_of_members = graphene.Int()
     location_code = graphene.String()
     location_name = graphene.String()
+    village_name = graphene.String()
+    ward_name = graphene.String()
+    district_name = graphene.String()
 
 
 class PmtEnrollmentResultType(graphene.ObjectType):

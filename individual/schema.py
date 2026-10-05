@@ -69,7 +69,7 @@ from individual.gql_queries import (
     apply_non_consented_filter,
     non_consented_marker_q,
     filter_by_pmt_class,
-    prefetch_group_heads,
+    prefetch_group_heads, pct_enrolled_q,
 )
 from individual.models import (
     Individual,
@@ -126,6 +126,9 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         groupPmtEligible=graphene.Boolean(
             description="Filter individuals by their group's PMT eligibility (true=PMT eligible groups only, false=non-eligible)"
         ),
+        groupPctEnrolled=graphene.Boolean(
+            description="Filter individuals by their group's PCT enrolment (true=members of enrolled households)"
+        ),
         groupIsNonConsented=graphene.Boolean(
             description="Filter individuals by their group's consent status (true=non-consented groups only, false=consented)"
         ),
@@ -180,6 +183,7 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         pmtScoreHousehold_Lt=graphene.Float(),
         pmtClassHousehold=graphene.String(),
         pmtEligible=graphene.Boolean(),
+        pctEnrolled=graphene.Boolean(description="Households enrolled in the PCT programme (active beneficiary)"),
     )
 
     group_history = OrderedDjangoFilterConnectionField(
@@ -341,6 +345,15 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         # ---- Consent filtering (positive filter, no negation) ----
         is_non_consented = kwargs.get("isNonConsented", None)
         apply_individual_consent_filter = is_non_consented is not None
+
+        group_pct_enrolled = kwargs.get("groupPctEnrolled", None)
+        if group_pct_enrolled is not None:
+            enrolled_groups = Group.objects.filter(is_deleted=False).filter(
+                pct_enrolled_q() if group_pct_enrolled else ~pct_enrolled_q()
+            ).values("id")
+            filters.append(Q(Exists(GroupIndividual.objects.filter(
+                individual_id=OuterRef("pk"), is_deleted=False, group_id__in=enrolled_groups,
+            ))))
 
         # ---- Group-level PMT eligibility filtering for Eligible Members page ----
         group_pmt_eligible = kwargs.get("groupPmtEligible", None)
@@ -666,6 +679,11 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
 
         pmt_class_wanted = None
 
+        pct_enrolled = kwargs.get("pctEnrolled")
+        if pct_enrolled is not None:
+            pmt_filter_requested = True
+            filters.append(pct_enrolled_q() if pct_enrolled else ~pct_enrolled_q())
+
         pmt_class_household = kwargs.get("pmtClassHousehold")
         if pmt_class_household:
             pmt_filter_requested = True
@@ -877,7 +895,7 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
 
             try:
                 location = Location.objects.filter(
-                    Q(id=location_uuid) | Q(uuid=location_uuid)
+                    uuid__iexact=location_uuid, validity_to__isnull=True
                 ).only("code").first()
             except Exception as e:
                 logger.warning(f"[PMT] Error resolving {param_name} UUID {location_uuid}: {e}")
@@ -924,6 +942,9 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
                 'number_of_members': household.get('number_of_members'),
                 'location_code': household.get('location_code'),
                 'location_name': household.get('location_name'),
+                'village_name': household.get('village_name'),
+                'ward_name': household.get('ward_name'),
+                'district_name': household.get('district_name'),
             })
 
         return PmtEnrollmentResultType(

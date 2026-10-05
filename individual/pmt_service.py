@@ -25,12 +25,31 @@ from core.services import BaseService
 from core.signals import register_service_signal
 from individual.apps import IndividualConfig
 from individual.models import Individual, Group, GroupIndividual, PmtConfig, PmtEnrollment, PmtGlobalFormula
-from individual.gql_queries import filter_by_pmt_class
+from individual.gql_queries import filter_by_pmt_class, non_consented_household_q
 from individual.validation import PmtGlobalFormulaValidation
 from location.models import LocationManager
 from tasks_management.services import UpdateCheckerLogicServiceMixin
 
 logger = logging.getLogger(__name__)
+
+
+def _location_names_by_type(location):
+    names, keys = {}, {"V": "village_name", "W": "ward_name", "D": "district_name"}
+    node = location
+    for depth in range(3):
+        if node is None:
+            break
+        if node.type in keys:
+            names[keys[node.type]] = node.name
+        node = node.parent if depth < 2 else None
+    return names
+
+
+def _as_number(value):
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
 
 
 class PmtService(BaseService):
@@ -89,22 +108,23 @@ class PmtService(BaseService):
 
     @staticmethod
     def _apply_location_filter(queryset, district_code=None, region_code=None):
-        if district_code:
-            return queryset.filter(
-                Q(location__code=district_code)
-                | Q(location__parent__code=district_code)
-                | Q(location__parent__parent__code=district_code)
-            )
+        code = district_code or region_code
+        if not code:
+            return queryset
+        return queryset.filter(location_id__in=PmtService._location_and_descendant_ids(code))
 
-        if region_code:
-            return queryset.filter(
-                Q(location__code=region_code)
-                | Q(location__parent__code=region_code)
-                | Q(location__parent__parent__code=region_code)
-                | Q(location__parent__parent__parent__code=region_code)
-            )
+    @staticmethod
+    def _location_and_descendant_ids(code):
+        from location.models import Location
 
-        return queryset
+        level = set(Location.objects.filter(code=code, validity_to__isnull=True).values_list("id", flat=True))
+        ids = set(level)
+        while level:
+            level = set(
+                Location.objects.filter(parent_id__in=level, validity_to__isnull=True).values_list("id", flat=True)
+            ) - ids
+            ids |= level
+        return list(ids)
 
     def get_households_with_pmt(self, district_code=None, region_code=None, offset=0, limit=10,
                                  search_text=None, pmt_class=None, pmt_cutoff=None):
@@ -123,11 +143,10 @@ class PmtService(BaseService):
         Returns:
             dict with households list and metadata (total_count, has_next, has_previous)
         """
-        # Start with groups, applying row-level security
         queryset = Group.get_queryset(Group.objects.filter(is_deleted=False), self.user)
-
-        # REQUIRED: Only include groups with PMT data
-        queryset = queryset.filter(json_ext__pmt_class_household__isnull=False)
+        queryset = queryset.alias(
+            pmt_class_key=KeyTextTransform("pmt_class_household", "json_ext"),
+        ).filter(pmt_class_key__isnull=False)
 
         queryset = self._apply_location_filter(
             queryset,
@@ -149,59 +168,59 @@ class PmtService(BaseService):
         # Get total count before pagination
         total_count = queryset.count()
 
-        # Paginate
-        group_individuals_prefetch = Prefetch(
+        page_ids = list(
+            queryset.order_by("-date_updated", "-id").values_list("id", flat=True)[offset:offset + limit]
+        )
+        members_prefetch = Prefetch(
             "groupindividuals",
-            queryset=GroupIndividual.objects.filter(
-                is_deleted=False,
-                individual__is_deleted=False,
-            ).select_related("individual"),
+            queryset=GroupIndividual.objects.filter(is_deleted=False, individual__is_deleted=False)
+            .annotate(
+                hhrep_code=KeyTextTransform("hhrep", "individual__json_ext"),
+                role_code=KeyTextTransform("individual_role_code", "individual__json_ext"),
+            )
+            .select_related("individual")
+            .only("id", "group_id", "role", "individual__id", "individual__first_name", "individual__last_name"),
         )
-        groups = list(
-            queryset.select_related("location")
-            .prefetch_related(group_individuals_prefetch)
-            .order_by('-date_updated')[offset:offset + limit]
+        rows = (
+            Group.objects.filter(id__in=page_ids)
+            .annotate(
+                pmt_score_value=KeyTextTransform("pmt_score_household", "json_ext"),
+                pmt_class_value=KeyTextTransform("pmt_class_household", "json_ext"),
+            )
+            .select_related("location__parent__parent")
+            .only(
+                "id", "code",
+                "location__id", "location__code", "location__name", "location__type",
+                "location__parent__id", "location__parent__name", "location__parent__type",
+                "location__parent__parent__id", "location__parent__parent__name", "location__parent__parent__type",
+            )
+            .prefetch_related(members_prefetch)
         )
+        by_id = {group.id: group for group in rows}
+        groups = [by_id[group_id] for group_id in page_ids if group_id in by_id]
 
-        # Build result with household data
         households = []
         for group in groups:
-            group_json_ext = group.json_ext or {}
-            members = []
-            head = None
-            hhrep_code = None
-            for group_individual in group.groupindividuals.all():
-                member = group_individual.individual
-                members.append(member)
-
-                if head is None and group_individual.role == GroupIndividual.Role.HEAD:
-                    head = member
-
-                if hhrep_code is None:
-                    hhrep_code = str((member.json_ext or {}).get("hhrep") or "").strip() or None
-
-            representative = next(
-                (
-                    member for member in members
-                    if str((member.json_ext or {}).get("individual_role_code") or "").strip() == hhrep_code
-                ),
-                None
-            ) if hhrep_code else None
-            member_count = len(members)
-
-            household_data = {
-                "group_uuid": str(group.uuid),
+            links = list(group.groupindividuals.all())
+            head_link = next((link for link in links if link.role == GroupIndividual.Role.HEAD), None)
+            hhrep_code = next((str(link.hhrep_code).strip() for link in links if link.hhrep_code), None)
+            rep_link = next(
+                (link for link in links if hhrep_code and str(link.role_code or "").strip() == hhrep_code), None
+            )
+            name = lambda link: f"{link.individual.first_name} {link.individual.last_name}" if link else None
+            households.append({
+                "group_uuid": str(group.id),
                 "group_code": group.code,
-                "hh_rep": f"{representative.first_name} {representative.last_name}" if representative else None,
-                "head_uuid": str(head.uuid) if head else None,
-                "head_name": f"{head.first_name} {head.last_name}" if head else None,
-                "pmt_score": group_json_ext.get("pmt_score_household"),
-                "pmt_class": group_json_ext.get("pmt_class_household"),
-                "number_of_members": member_count,
+                "hh_rep": name(rep_link),
+                "head_uuid": str(head_link.individual.id) if head_link else None,
+                "head_name": name(head_link),
+                "pmt_score": _as_number(group.pmt_score_value),
+                "pmt_class": group.pmt_class_value,
+                "number_of_members": len(links),
                 "location_code": group.location.code if group.location else None,
                 "location_name": group.location.name if group.location else None,
-            }
-            households.append(household_data)
+                **_location_names_by_type(group.location),
+            })
 
         return {
             "households": households,
@@ -990,7 +1009,7 @@ class PmtService(BaseService):
             poor_groups = self._apply_location_filter(
                 filter_by_pmt_class(
                     Group.objects.filter(is_deleted=False), "POOR"
-                ),
+                ).exclude(non_consented_household_q()),
                 district_code=district_code,
             )
 
@@ -1074,7 +1093,7 @@ class PctAutoEnrollmentService(BaseService):
     def __init__(self, user):
         super().__init__(user)
 
-    def sync_pending_poor_households(self, district_code=None, region_code=None):
+    def sync_pending_poor_households(self, district_code=None, region_code=None, group_ids=None):
         if not IndividualConfig.pct_auto_enroll_enabled:
             return {
                 "success": True,
@@ -1110,6 +1129,7 @@ class PctAutoEnrollmentService(BaseService):
         enrollments = self._get_target_enrollments(
             district_code=district_code,
             region_code=region_code,
+            group_ids=group_ids,
         )
         if not enrollments:
             return {
@@ -1248,7 +1268,7 @@ class PctAutoEnrollmentService(BaseService):
             )
         return benefit_plan
 
-    def _get_target_enrollments(self, district_code=None, region_code=None):
+    def _get_target_enrollments(self, district_code=None, region_code=None, group_ids=None):
         queryset = PmtEnrollment.objects.filter(
             is_deleted=False,
             pmt_class=PmtEnrollment.PmtClass.POOR,
@@ -1260,11 +1280,13 @@ class PctAutoEnrollmentService(BaseService):
                 json_ext__pct_auto_enrollment__beneficiary_id__isnull=True,
             )
         )
+        if group_ids is not None:
+            queryset = queryset.filter(group_id__in=group_ids)
         queryset = self._apply_enrollment_location_filter(
             queryset,
             district_code=district_code,
             region_code=region_code,
-        )
+        ).exclude(non_consented_household_q("group_id"))
         return list(queryset.select_related("group"))
 
     @staticmethod

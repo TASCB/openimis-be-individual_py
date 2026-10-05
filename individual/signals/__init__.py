@@ -71,6 +71,12 @@ def bind_service_signals():
         on_task_complete_service_handler(PmtGlobalFormulaService),
         bind_type=ServiceSignalBindType.AFTER
     )
+    from individual.pct_enrolment import on_task_complete_pct_enrolment
+    bind_service_signal(
+        'task_service.complete_task',
+        on_task_complete_pct_enrolment,
+        bind_type=ServiceSignalBindType.AFTER
+    )
     bind_service_signal(
         'task_service.resolve_task',
         on_task_resolve,

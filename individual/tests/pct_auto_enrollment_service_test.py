@@ -19,7 +19,7 @@ class _FakeQuerySet(list):
 class _FakeGroupBeneficiaryManager:
     def __init__(self, existing=None):
         self.items = list(existing or [])
-        self._next_id = max([getattr(item, 'id', 0) for item in self.items] or [0]) + 1
+        self._next_id = max([getattr(item, 'id', None) or 0 for item in self.items] or [0]) + 1
 
     def filter(self, **kwargs):
         result = []

@@ -38,8 +38,12 @@ DEFAULT_CONFIG = {
     "deduplication_review_event": "individual_deduplication.resolve",
     "pct_auto_enroll_enabled": True,
     "pct_auto_enroll_on_rerun": True,
-    "pct_benefit_plan_code": "002",
+    "pct_benefit_plan_code": "PCT",
+    "pct_benefit_plan_name": "Productive Cash Transfer",
     "pct_group_beneficiary_status": "ACTIVE",
+    "pct_enroll_on_import": True,
+    "enable_maker_checker_for_pct_enrolment": True,
+    "pct_enrolment_task_event": "individual.pct_enrolment",
     "enable_python_workflows": True,
     "enable_maker_checker_logic_import": True,
     "enable_maker_checker_for_individual_upload": True,
@@ -96,7 +100,11 @@ class IndividualConfig(AppConfig):
     pct_auto_enroll_enabled = None
     pct_auto_enroll_on_rerun = None
     pct_benefit_plan_code = None
+    pct_benefit_plan_name = None
     pct_group_beneficiary_status = None
+    pct_enroll_on_import = None
+    enable_maker_checker_for_pct_enrolment = None
+    pct_enrolment_task_event = None
 
     enable_maker_checker_for_individual_upload = None
     enable_maker_checker_for_group_upload = None

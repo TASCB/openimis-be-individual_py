@@ -3,6 +3,7 @@ import logging
 from core.models import User
 from individual.workflows.utils import SqlProcedurePythonWorkflow
 from individual.services import IndividualImportService
+from individual.pct_enrolment import PctEnrolmentService
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,11 @@ def process_update_valid_individuals_workflow(user_uuid, upload_uuid, accepted=N
         IndividualImportService(user).link_groups_for_upload_uuid(str(upload_uuid))
     except Exception as e:
         logger.exception("Group linking (update) failed for upload %s: %s", upload_uuid, e)
+
+    try:
+        PctEnrolmentService(user).raise_for_upload(str(upload_uuid))
+    except Exception as e:
+        logger.exception("PCT enrolment task failed for upload %s: %s", upload_uuid, e)
 
 
 # --------------------------
