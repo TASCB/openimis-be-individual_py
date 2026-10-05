@@ -5,6 +5,9 @@ is_unit_test_env = getattr(settings, 'IS_UNIT_TEST_ENV', False)
 
 # Check if the 'opensearch_reports' app is in INSTALLED_APPS
 if 'opensearch_reports' in apps.app_configs:
+    from functools import lru_cache
+
+    from location.models import Location
     from opensearch_reports.service import BaseSyncDocument
     from django_opensearch_dsl import fields as opensearch_fields
     from django_opensearch_dsl.registries import registry
@@ -37,6 +40,35 @@ if 'opensearch_reports' in apps.app_configs:
         value = str(value).strip().upper()
         return value or None
 
+    def extract_disability(json_ext):
+        jx = json_ext if isinstance(json_ext, dict) else {}
+        nested = jx.get('json_ext') if isinstance(jx.get('json_ext'), dict) else {}
+        value = jx.get('disability', nested.get('disability'))
+        if value in (None, ''):
+            return None
+        return 'YES' if str(value).strip().upper() in ('1', 'TRUE', 'YES', 'Y') else 'NO'
+
+    @lru_cache(maxsize=65536)
+    def region_and_district(location_id):
+        region = district = None
+        while location_id:
+            row = Location.objects.filter(id=location_id).values('type', 'name', 'parent_id').first()
+            if not row:
+                break
+            if row['type'] == 'D':
+                district = row['name']
+            elif row['type'] == 'R':
+                region = row['name']
+            location_id = row['parent_id']
+        return region, district
+
+    def household_pmt_class(individual):
+        membership = (GroupIndividual.objects
+                      .filter(individual=individual, is_deleted=False, is_active=True)
+                      .order_by('-date_created').values('group__json_ext').first())
+        group_ext = (membership or {}).get('group__json_ext') or {}
+        return group_ext.get('pmt_class_household') or (individual.json_ext or {}).get('pmt_class')
+
     @registry.register_document
     class IndividualDocument(BaseSyncDocument):
         DASHBOARD_NAME = 'Individual'
@@ -46,6 +78,10 @@ if 'opensearch_reports' in apps.app_configs:
         dob = opensearch_fields.DateField()
         gender = opensearch_fields.KeywordField()
         date_created = opensearch_fields.DateField()
+        region = opensearch_fields.KeywordField()
+        district = opensearch_fields.KeywordField()
+        disability = opensearch_fields.KeywordField()
+        pmt_class = opensearch_fields.KeywordField()
         json_ext = opensearch_fields.ObjectField(dynamic=False)
 
         class Index:
@@ -65,6 +101,18 @@ if 'opensearch_reports' in apps.app_configs:
 
         def prepare_gender(self, instance):
             return extract_gender(getattr(instance, 'json_ext', None))
+
+        def prepare_region(self, instance):
+            return region_and_district(instance.location_id)[0]
+
+        def prepare_district(self, instance):
+            return region_and_district(instance.location_id)[1]
+
+        def prepare_disability(self, instance):
+            return extract_disability(instance.json_ext)
+
+        def prepare_pmt_class(self, instance):
+            return household_pmt_class(instance)
 
         def prepare_json_ext(self, instance):
             return {}
@@ -88,6 +136,8 @@ if 'opensearch_reports' in apps.app_configs:
             'code': opensearch_fields.KeywordField(),
             'location_code': opensearch_fields.KeywordField(),
             'location_name': opensearch_fields.KeywordField(),
+            'region': opensearch_fields.KeywordField(),
+            'district': opensearch_fields.KeywordField(),
             'head': opensearch_fields.KeywordField(),
             'head_id': opensearch_fields.KeywordField(),
             'primary_recipient': opensearch_fields.KeywordField(),
@@ -105,6 +155,7 @@ if 'opensearch_reports' in apps.app_configs:
             'last_name': opensearch_fields.KeywordField(),
             'dob': opensearch_fields.DateField(),
             'gender': opensearch_fields.KeywordField(),
+            'disability': opensearch_fields.KeywordField(),
         })
         role = opensearch_fields.KeywordField()
         recipient_type = opensearch_fields.KeywordField()
@@ -141,6 +192,7 @@ if 'opensearch_reports' in apps.app_configs:
                 'last_name': ind.last_name,
                 'dob': ind.dob,
                 'gender': extract_gender(getattr(ind, 'json_ext', None)),
+                'disability': extract_disability(getattr(ind, 'json_ext', None)),
             }
 
         def prepare_group(self, instance):
@@ -152,11 +204,14 @@ if 'opensearch_reports' in apps.app_configs:
                 pmt_score = float(pmt_score) if pmt_score not in (None, '') else None
             except (TypeError, ValueError):
                 pmt_score = None
+            region, district = region_and_district(group.location_id)
             return {
                 'id': str(group.id),
                 'code': group.code,
                 'location_code': json_ext.get('location_code'),
                 'location_name': json_ext.get('location_name'),
+                'region': region,
+                'district': district,
                 'head': json_ext.get('head'),
                 'head_id': json_ext.get('head_id'),
                 'primary_recipient': json_ext.get('primary_recipient'),
