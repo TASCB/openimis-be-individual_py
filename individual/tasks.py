@@ -5,6 +5,33 @@ from celery import shared_task
 logger = logging.getLogger(__name__)
 
 
+def _audit_start(service, mutation_id, operation, district_code, pmt_cutoff, user, region_code=None):
+    from individual.models import PmtRunProgress
+    try:
+        before = service.district_snapshot(district_code, region_code)
+        PmtRunProgress.objects.filter(mutation_id=mutation_id).update(
+            operation=operation,
+            user=user,
+            pmt_cutoff=pmt_cutoff,
+            previous_cutoff=before["cutoff"],
+            poor_before=before["poor"],
+            non_poor_before=before["non_poor"],
+        )
+    except Exception as e:
+        logger.warning(f"[PMT Task] Could not record audit start: {e}")
+
+
+def _audit_end(service, mutation_id, district_code, region_code=None):
+    from individual.models import PmtRunProgress
+    try:
+        after = service.district_snapshot(district_code, region_code)
+        PmtRunProgress.objects.filter(mutation_id=mutation_id).update(
+            poor_after=after["poor"], non_poor_after=after["non_poor"],
+        )
+    except Exception as e:
+        logger.warning(f"[PMT Task] Could not record audit end: {e}")
+
+
 @shared_task(bind=True, max_retries=0, name="individual.rerun_pmt")
 def rerun_pmt_task(self, district_code, region_code, pmt_cutoff, user_id, mutation_id):
     """
@@ -37,6 +64,7 @@ def rerun_pmt_task(self, district_code, region_code, pmt_cutoff, user_id, mutati
     try:
         user = User.objects.get(id=user_id)
         service = PmtService(user)
+        _audit_start(service, mutation_id, PmtRunProgress.Operation.RERUN, district_code, pmt_cutoff, user)
 
         result = service.rerun_pmt(
             district_code=district_code,
@@ -44,6 +72,7 @@ def rerun_pmt_task(self, district_code, region_code, pmt_cutoff, user_id, mutati
             pmt_cutoff=pmt_cutoff,
             mutation_id=mutation_id,
         )
+        _audit_end(service, mutation_id, district_code)
 
         logger.info(
             f"[PMT Task] Completed: "
@@ -101,7 +130,7 @@ def adjust_pmt_cutoff_task(self, district_code, region_code, pmt_cutoff, user_id
             mutation_id=mutation_id,
             defaults={
                 "status": PmtRunProgress.Status.STARTED,
-                "district_code": district_code,
+                "district_code": district_code or region_code or "",
             }
         )
     except Exception as e:
@@ -110,13 +139,19 @@ def adjust_pmt_cutoff_task(self, district_code, region_code, pmt_cutoff, user_id
     try:
         user = User.objects.get(id=user_id)
         service = PmtService(user)
+        _audit_start(service, mutation_id, PmtRunProgress.Operation.CUTOFF_ADJUSTMENT, district_code, pmt_cutoff,
+                     user, region_code)
 
-        result = service.adjust_pmt_cutoff(
-            district_code=district_code,
-            region_code=region_code,
-            pmt_cutoff=pmt_cutoff,
-            mutation_id=mutation_id,
-        )
+        if district_code or region_code:
+            result = service.adjust_pmt_cutoff(
+                district_code=district_code,
+                region_code=region_code,
+                pmt_cutoff=pmt_cutoff,
+                mutation_id=mutation_id,
+            )
+        else:
+            result = service.adjust_pmt_cutoff_all(pmt_cutoff=pmt_cutoff, mutation_id=mutation_id)
+        _audit_end(service, mutation_id, district_code, region_code)
 
         logger.info(
             f"[PMT Cutoff Adjustment Task] Completed: "

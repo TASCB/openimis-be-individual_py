@@ -753,7 +753,7 @@ class RerunPmtMutation(OpenIMISMutation):
 
 
 class AdjustPmtCutoffInputType(OpenIMISMutation.Input):
-    district_code = graphene.String(required=True)
+    district_code = graphene.String(required=False)
     region_code = graphene.String(required=False)
     pmt_cutoff = graphene.Float(required=True)
 

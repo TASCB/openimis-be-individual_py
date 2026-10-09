@@ -12,6 +12,7 @@ This service handles:
 - Managing PMT Enrollment with auto-enrollment workflow
 """
 
+import json
 import logging
 import time
 from datetime import datetime
@@ -298,9 +299,12 @@ class PmtService(BaseService):
             # (5) Short per-user TTL cache. The audit summary doesn't need to be
             # live - reruns dispatch async via Celery and the next refresh after
             # this TTL expires picks up new counts.
+            from individual.models import PmtRunProgress
             user_id = getattr(self.user, "id", None) or "anon"
+            last_run = (PmtRunProgress.objects.filter(status=PmtRunProgress.Status.COMPLETED)
+                        .order_by("-completed_at").values_list("completed_at", flat=True).first())
             cache_key = (
-                f"pmt_audit_summary:{user_id}:"
+                f"pmt_audit_summary:v2:{last_run.timestamp() if last_run else 0}:{user_id}:"
                 f"{district_code or ''}:{region_code or ''}:{offset}:{limit}"
             )
             cached = cache.get(cache_key)
@@ -349,19 +353,34 @@ class PmtService(BaseService):
                         cutoff_row["pmt_cutoff_text"]
                     )
 
+            last_run_by_district = {}
+            district_codes = [row["district_code"] for row in rows if row.get("district_code")]
+            if district_codes:
+                from individual.models import PmtRunProgress
+                last_run_by_district = dict(
+                    PmtRunProgress.objects
+                    .filter(district_code__in=district_codes, status=PmtRunProgress.Status.COMPLETED)
+                    .values("district_code")
+                    .annotate(last=Max("completed_at"))
+                    .values_list("district_code", "last")
+                )
+
+            formula_history = self._formula_cutoff_history()
             districts_data = []
             for row in rows:
-                pmt_cutoff_used = latest_cutoff_by_district.get(row.get("district_id"))
-                if pmt_cutoff_used not in (None, ""):
-                    try:
-                        pmt_cutoff_used = float(pmt_cutoff_used)
-                    except (TypeError, ValueError):
-                        pass
+                pmt_cutoff_used = _as_number(latest_cutoff_by_district.get(row.get("district_id")))
+                pmt_date = last_run_by_district.get(row.get("district_code")) or row.get("latest_update")
+                cutoff_source = "RUN"
+                if pmt_cutoff_used is None:
+                    pmt_cutoff_used = self._formula_cutoff_at(row.get("latest_update"), formula_history)
+                    cutoff_source = "FORMULA"
 
                 districts_data.append({
                     "district_code": row.get("district_code"),
                     "district_name": row.get("district_name"),
                     "pmt_cutoff": pmt_cutoff_used,
+                    "cutoff_source": cutoff_source,
+                    "pmt_date": pmt_date,
                     "poor_count": row.get("poor_count", 0) or 0,
                     "non_poor_count": row.get("non_poor_count", 0) or 0,
                 })
@@ -387,6 +406,46 @@ class PmtService(BaseService):
                 "offset": offset,
                 "limit": limit,
             }
+
+    @staticmethod
+    def _formula_cutoff_history():
+        return [
+            (history_date, _as_number((formula or {}).get("cutoff")))
+            for history_date, formula in PmtGlobalFormula.history
+            .filter(is_active=True, is_deleted=False)
+            .order_by("history_date")
+            .values_list("history_date", "formula")
+        ]
+
+    @staticmethod
+    def _formula_cutoff_at(when, history):
+        if not history:
+            return None
+        cutoff = history[0][1]
+        for effective_from, version_cutoff in history:
+            if when is not None and effective_from > when:
+                break
+            cutoff = version_cutoff
+        return cutoff
+
+    def district_snapshot(self, district_code=None, region_code=None):
+        queryset = self._base_groups_with_pmt(district_code=district_code, region_code=region_code)
+        counts = queryset.aggregate(
+            poor=Count("id", filter=Q(json_ext__pmt_class_household="POOR")),
+            non_poor=Count("id", filter=Q(json_ext__pmt_class_household="NON_POOR")),
+            latest=Max("date_updated"),
+        )
+        cutoff = _as_number(
+            queryset
+            .exclude(json_ext__pmt_cutoff_used__isnull=True)
+            .annotate(cutoff_text=KeyTextTransform("pmt_cutoff_used", "json_ext"))
+            .order_by("-date_updated")
+            .values_list("cutoff_text", flat=True)
+            .first()
+        )
+        if cutoff is None:
+            cutoff = self._formula_cutoff_at(counts["latest"], self._formula_cutoff_history())
+        return {"cutoff": cutoff, "poor": counts["poor"], "non_poor": counts["non_poor"]}
 
     @transaction.atomic()
     def rerun_pmt(self, district_code, region_code=None, pmt_cutoff=11.01, mutation_id=None):
@@ -740,7 +799,7 @@ class PmtService(BaseService):
                     mutation_id=mutation_id,
                     defaults={
                         'status': PmtRunProgress.Status.STARTED,
-                        'district_code': district_code,
+                        'district_code': district_code or region_code or '',
                     }
                 )
                 logger.info(f"PMT cutoff adjustment tracking initialized for mutation {mutation_id}")
@@ -748,10 +807,10 @@ class PmtService(BaseService):
                 logger.warning(f"Failed to initialize PMT cutoff adjustment tracking: {str(e)}")
 
         try:
-            if not district_code:
+            if not district_code and not region_code:
                 return {
                     "success": False,
-                    "errors": ["district_code is required"],
+                    "errors": ["district_code or region_code is required"],
                     "updated_individuals": 0,
                     "updated_groups": 0,
                 }
@@ -892,7 +951,8 @@ class PmtService(BaseService):
                     enrollments_count = self._auto_enroll_poor_households(
                         district_code=district_code,
                         pmt_cutoff=pmt_cutoff,
-                        progress=progress
+                        progress=progress,
+                        region_code=region_code,
                     )
 
                     pct_sync_result = None
@@ -946,6 +1006,120 @@ class PmtService(BaseService):
                 "updated_groups": 0,
             }
 
+    ADJUST_ALL_CHUNK = 5000
+    _NUMERIC_SCORE = r'^-?[0-9]+(\.[0-9]+)?$'
+
+    def adjust_pmt_cutoff_all(self, pmt_cutoff, mutation_id=None):
+        from django.db import connection
+        from individual.models import PmtRunProgress
+
+        start_time = time.time()
+        try:
+            pmt_cutoff = float(pmt_cutoff)
+        except (TypeError, ValueError):
+            return {"success": False, "errors": ["Invalid pmt_cutoff value - must be a valid number"],
+                    "updated_individuals": 0, "updated_groups": 0}
+        if pmt_cutoff < 0 or pmt_cutoff > 50:
+            return {"success": False, "errors": [f"PMT cutoff must be between 0 and 50, received {pmt_cutoff}"],
+                    "updated_individuals": 0, "updated_groups": 0}
+
+        group_ids = list(
+            Group.get_queryset(Group.objects.filter(is_deleted=False), self.user)
+            .filter(json_ext__has_key="pmt_score_household")
+            .values_list("id", flat=True)
+        )
+        if mutation_id:
+            PmtRunProgress.objects.filter(mutation_id=mutation_id).update(
+                total_groups=len(group_ids), status=PmtRunProgress.Status.CALCULATING)
+
+        now = timezone.now()
+        stamp = {
+            "pmt_cutoff_used": pmt_cutoff,
+            "pmt_last_operation": "CUTOFF_ADJUSTMENT",
+            "pmt_last_cutoff": pmt_cutoff,
+            "pmt_last_updated_at": now.isoformat(),
+        }
+        if mutation_id:
+            stamp["pmt_last_mutation_id"] = str(mutation_id)
+        member_stamp = {k: v for k, v in stamp.items() if k != "pmt_cutoff_used"}
+        user_id = getattr(self.user, "id", None)
+        score = """("Json_ext"->>'pmt_score_household')::numeric"""
+
+        updated_groups = updated_individuals = 0
+        for offset in range(0, len(group_ids), self.ADJUST_ALL_CHUNK):
+            chunk = [str(g) for g in group_ids[offset:offset + self.ADJUST_ALL_CHUNK]]
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute(
+                    f"""UPDATE individual_group SET
+                          "Json_ext" = "Json_ext" || %s::jsonb || jsonb_build_object(
+                              'pmt_score_household', {score},
+                              'pmt_class_household', CASE WHEN {score} <= %s THEN 'POOR' ELSE 'NON_POOR' END),
+                          "DateUpdated" = %s, "UserUpdatedUUID" = %s
+                        WHERE "UUID" = ANY(%s::uuid[])
+                          AND "Json_ext"->>'pmt_score_household' ~ %s""",
+                    [json.dumps(stamp), pmt_cutoff, now, user_id, chunk, self._NUMERIC_SCORE],
+                )
+                updated_groups += cursor.rowcount
+                cursor.execute(
+                    """UPDATE individual_individual i SET
+                          "Json_ext" = i."Json_ext" || %s::jsonb || jsonb_build_object(
+                              'pmt_score', g."Json_ext"->'pmt_score_household',
+                              'pmt_class', g."Json_ext"->'pmt_class_household'),
+                          "DateUpdated" = %s, "UserUpdatedUUID" = %s
+                        FROM individual_groupindividual gi
+                        JOIN individual_group g ON g."UUID" = gi.group_id
+                        WHERE gi.individual_id = i."UUID" AND NOT gi."isDeleted" AND NOT i."isDeleted"
+                          AND g."UUID" = ANY(%s::uuid[])
+                          AND g."Json_ext"->>'pmt_last_updated_at' = %s""",
+                    [json.dumps(member_stamp), now, user_id, chunk, stamp["pmt_last_updated_at"]],
+                )
+                updated_individuals += cursor.rowcount
+            if mutation_id:
+                PmtRunProgress.objects.filter(mutation_id=mutation_id).update(
+                    processed_groups=offset + len(chunk), processed_individuals=updated_individuals)
+
+        skipped = len(group_ids) - updated_groups
+        errors = [f"{skipped} households have a non-numeric stored PMT score and were skipped"] if skipped else []
+
+        enrollments_count = 0
+        pct_sync_result = None
+        if updated_groups:
+            if mutation_id:
+                PmtRunProgress.objects.filter(mutation_id=mutation_id).update(
+                    total_individuals=updated_individuals, status=PmtRunProgress.Status.ENROLLING)
+            try:
+                with transaction.atomic():
+                    enrollments_count = self._auto_enroll_poor_households(district_code=None, pmt_cutoff=pmt_cutoff)
+                if IndividualConfig.pct_auto_enroll_on_rerun:
+                    pct_sync_result = PctAutoEnrollmentService(self.user).sync_pending_poor_households()
+                    logger.info("PCT sync after whole-database cutoff adjustment: %s", pct_sync_result)
+            except Exception as e:
+                logger.error("Whole-database cutoff adjustment auto-enrollment failed: %s", e, exc_info=True)
+                errors.append(f"Auto-enrollment warning: {e}")
+
+        if mutation_id:
+            PmtRunProgress.objects.filter(mutation_id=mutation_id).update(
+                total_individuals=updated_individuals,
+                enrollments_created=enrollments_count,
+                poor_groups_found=enrollments_count,
+                status=PmtRunProgress.Status.COMPLETED,
+                completed_at=timezone.now(),
+                errors=errors,
+            )
+        logger.info(
+            "PMT cutoff adjustment (all households): cutoff=%s groups=%s individuals=%s skipped=%s in %.1fs",
+            pmt_cutoff, updated_groups, updated_individuals, skipped, time.time() - start_time,
+        )
+        return {
+            "success": not errors,
+            "errors": errors,
+            "updated_individuals": updated_individuals,
+            "updated_groups": updated_groups,
+            "enrollments_created": enrollments_count,
+            "pct_sync": pct_sync_result,
+            "district_code": None,
+        }
+
     def _get_existing_household_pmt_score(self, group, members):
         """
         Resolve the stored household PMT score from canonical group storage first,
@@ -989,7 +1163,7 @@ class PmtService(BaseService):
         if district_code:
             json_ext["pmt_last_district_code"] = str(district_code)
 
-    def _auto_enroll_poor_households(self, district_code, pmt_cutoff, progress=None):
+    def _auto_enroll_poor_households(self, district_code, pmt_cutoff, progress=None, region_code=None):
         """
         Auto-enrollment workflow after PMT rerun.
         Creates PmtEnrollment records for all POOR households in the district.
@@ -1011,6 +1185,7 @@ class PmtService(BaseService):
                     Group.objects.filter(is_deleted=False), "POOR"
                 ).exclude(non_consented_household_q()),
                 district_code=district_code,
+                region_code=region_code,
             )
 
             poor_groups_list = list(poor_groups)
@@ -1161,12 +1336,17 @@ class PctAutoEnrollmentService(BaseService):
         created = 0
         updated = 0
         linked = 0
+        kept = 0
         target_status = str(IndividualConfig.pct_group_beneficiary_status or "ACTIVE")
+        keep_statuses = {str(x).upper() for x in (IndividualConfig.pct_auto_enroll_keep_statuses or [])}
         synced_at = timezone.now()
 
         with transaction.atomic():
             for enrollment in enrollments:
                 beneficiary = existing_by_group.get(enrollment.group_id)
+                if beneficiary is not None and str(beneficiary.status).upper() in keep_statuses:
+                    kept += 1
+                    continue
                 if beneficiary is None:
                     beneficiary = GroupBeneficiary(
                         group=enrollment.group,
@@ -1227,14 +1407,16 @@ class PctAutoEnrollmentService(BaseService):
                     linked += 1
 
         logger.info(
-            "PCT auto-enrollment sync completed: processed=%s created=%s updated=%s linked=%s district=%s region=%s",
-            len(enrollments), created, updated, linked, district_code, region_code,
+            "PCT auto-enrollment sync completed: processed=%s created=%s updated=%s linked=%s kept=%s "
+            "district=%s region=%s",
+            len(enrollments), created, updated, linked, kept, district_code, region_code,
         )
         return {
             "success": True,
             "created": created,
             "updated": updated,
             "linked": linked,
+            "kept": kept,
             "processed": len(enrollments),
             "detail": "ok",
         }
