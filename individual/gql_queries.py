@@ -10,7 +10,8 @@ from core import prefix_filterset, ExtendedConnection
 from core.gql_queries import UserGQLType
 from individual.apps import IndividualConfig
 from individual.models import Individual, IndividualDataSource, Group, GroupIndividual, \
-    IndividualDataSourceUpload, IndividualDataUploadRecords, GroupDataSource, PmtConfig, PmtEnrollment, PmtRunProgress
+    IndividualDataSourceUpload, IndividualDataUploadRecords, GroupDataSource, PmtConfig, PmtEnrollment, PmtRunProgress, \
+    PmtGlobalFormula
 
 
 def _have_permissions(user, permission):
@@ -680,6 +681,49 @@ class PmtConfigConnection(graphene.relay.Connection):
         node = PmtConfigGQLType
 
 
+class PmtRunHistoryGQLType(DjangoObjectType):
+    user_updated = graphene.Field(UserGQLType)
+    district_name = graphene.String()
+
+    def resolve_user_updated(self, info):
+        return self.user
+
+    def resolve_district_name(self, info):
+        return getattr(self, "district_name", None)
+
+    class Meta:
+        model = PmtRunProgress
+        interfaces = (graphene.relay.Node,)
+        exclude = ("user",)
+        filter_fields = {
+            "district_code": ["exact", "icontains"],
+            "operation": ["exact"],
+            "status": ["exact"],
+            "started_at": ["exact", "lt", "lte", "gt", "gte"],
+            **prefix_filterset("user__", UserGQLType._meta.filter_fields),
+        }
+        connection_class = ExtendedConnection
+
+
+class PmtGlobalFormulaHistoryGQLType(DjangoObjectType):
+    user_updated = graphene.Field(UserGQLType)
+
+    def resolve_user_updated(self, info):
+        return self.user_updated
+
+    class Meta:
+        model = PmtGlobalFormula.history.model
+        interfaces = (graphene.relay.Node,)
+        filter_fields = {
+            "id": ["exact"],
+            "date_updated": ["exact", "lt", "lte", "gt", "gte"],
+            "is_deleted": ["exact"],
+            "version": ["exact"],
+            **prefix_filterset("user_updated__", UserGQLType._meta.filter_fields),
+        }
+        connection_class = ExtendedConnection
+
+
 class PmtGlobalFormulaGQLType(graphene.ObjectType):
     """
     The single, system-wide PMT formula (coefficients + cutoff). Edited through
@@ -749,6 +793,8 @@ class PmtDistrictSummaryType(graphene.ObjectType):
     district_code = graphene.String()
     district_name = graphene.String()
     pmt_cutoff = graphene.Float()
+    cutoff_source = graphene.String(description="RUN (rerun/adjustment) or FORMULA (global formula at import)")
+    pmt_date = graphene.DateTime()
     poor_count = graphene.Int()
     non_poor_count = graphene.Int()
 

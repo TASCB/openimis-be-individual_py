@@ -467,6 +467,21 @@ class PmtRunProgress(models.Model):
     enrollments_created = models.IntegerField(default=0, help_text="PmtEnrollment records created")
     errors = models.JSONField(default=list, help_text="List of errors encountered")
 
+    class Operation(models.TextChoices):
+        RERUN = 'RERUN', _('PMT Rerun')
+        CUTOFF_ADJUSTMENT = 'CUTOFF_ADJUSTMENT', _('Cutoff Adjustment')
+
+    operation = models.CharField(max_length=20, choices=Operation.choices, null=True, blank=True)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='+',
+    )
+    pmt_cutoff = models.FloatField(null=True, blank=True, help_text="Cutoff applied by this run")
+    previous_cutoff = models.FloatField(null=True, blank=True, help_text="District cutoff before this run")
+    poor_before = models.IntegerField(null=True, blank=True)
+    non_poor_before = models.IntegerField(null=True, blank=True)
+    poor_after = models.IntegerField(null=True, blank=True)
+    non_poor_after = models.IntegerField(null=True, blank=True)
+
     # Timestamps
     started_at = models.DateTimeField(auto_now_add=True, help_text="When rerun started")
     completed_at = models.DateTimeField(null=True, blank=True, help_text="When rerun completed")

@@ -66,6 +66,8 @@ from individual.gql_queries import (
     PmtEnrollmentResultType,
     PmtRunProgressType,
     PmtGlobalFormulaGQLType,
+    PmtRunHistoryGQLType,
+    PmtGlobalFormulaHistoryGQLType,
     apply_non_consented_filter,
     non_consented_marker_q,
     filter_by_pmt_class,
@@ -275,6 +277,17 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         mutation_id=graphene.UUID(required=True),
     )
 
+    pmt_run_history = OrderedDjangoFilterConnectionField(
+        PmtRunHistoryGQLType,
+        orderBy=graphene.List(of_type=graphene.String),
+    )
+
+    pmt_global_formula_history = OrderedDjangoFilterConnectionField(
+        PmtGlobalFormulaHistoryGQLType,
+        orderBy=graphene.List(of_type=graphene.String),
+        applyDefaultValidityFilter=graphene.Boolean(),
+    )
+
     pmt_global_formula = graphene.Field(
         PmtGlobalFormulaGQLType,
         description="The single global PMT formula (provisioned on first read).",
@@ -465,6 +478,23 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
             )
         except PmtRunProgress.DoesNotExist:
             return None
+
+    def resolve_pmt_run_history(self, info, **kwargs):
+        from location.models import Location
+        from individual.models import PmtRunProgress
+
+        Query._check_permissions(info.context.user, IndividualConfig.gql_pmt_rerun_perms)
+        district_name = Location.objects.filter(
+            code=OuterRef("district_code"), validity_to__isnull=True,
+        ).values("name")[:1]
+        return PmtRunProgress.objects.select_related("user").annotate(district_name=Subquery(district_name))
+
+    def resolve_pmt_global_formula_history(self, info, **kwargs):
+        from individual.models import PmtGlobalFormula
+
+        Query._check_permissions(info.context.user, IndividualConfig.gql_pmt_rerun_perms)
+        query = PmtGlobalFormula.history.filter(*append_validity_filter(**kwargs))
+        return gql_optimizer.query(query, info)
 
     def resolve_pmt_global_formula(self, info, **kwargs):
         from individual.pmt_service import PmtGlobalFormulaService
