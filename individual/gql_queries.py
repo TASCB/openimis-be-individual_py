@@ -1,4 +1,5 @@
 import graphene
+from deduplication.gql_queries import DeduplicationSummaryRowGQLType
 import django_filters
 from django.db.models import Q
 from django.db.models.fields.json import KeyTextTransform
@@ -854,3 +855,9 @@ class PmtRunProgressType(graphene.ObjectType):
     errors = graphene.List(graphene.String)
     started_at = graphene.DateTime()
     completed_at = graphene.DateTime()
+
+
+class IndividualDeduplicationSummaryGQLType(graphene.ObjectType):
+    rows = graphene.List(DeduplicationSummaryRowGQLType)
+    total = graphene.Int()
+    limit = graphene.Int()

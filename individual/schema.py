@@ -8,14 +8,16 @@ import django_filters
 import pandas as pd
 
 from django.contrib.auth.models import AnonymousUser
-from django.db.models import Q, OuterRef, Subquery, Exists
+from django.db.models import Q, OuterRef, Subquery, Exists, TextField, Value
+from django.db.models.fields.json import KeyTextTransform
+from django.db.models.functions import Replace
 
 from core.custom_filters import CustomFilterWizardStorage
 from core.gql.export_mixin import ExportableQueryMixin
 from core.schema import OrderedDjangoFilterConnectionField
 from core.services import wait_for_mutation
 from core.utils import append_validity_filter, is_valid_uuid
-from deduplication.gql_queries import DeduplicationSummaryGQLType, DeduplicationSummaryRowGQLType
+from deduplication.gql_queries import DeduplicationSummaryRowGQLType
 from individual.apps import IndividualConfig
 from individual.gql_mutations import (
     CreateIndividualMutation,
@@ -44,6 +46,7 @@ from individual.gql_mutations import (
     UpdatePmtGlobalFormulaMutation,
 )
 from individual.gql_queries import (
+    IndividualDeduplicationSummaryGQLType,
     IndividualGQLType,
     IndividualHistoryGQLType,
     IndividualDataSourceGQLType,
@@ -134,6 +137,8 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         groupIsNonConsented=graphene.Boolean(
             description="Filter individuals by their group's consent status (true=non-consented groups only, false=consented)"
         ),
+        headName=graphene.String(description="Every word must match the first or last name"),
+        interviewKey=graphene.String(description="Interview key, with or without dashes"),
     )
 
     individual_history = OrderedDjangoFilterConnectionField(
@@ -294,10 +299,11 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
     )
 
     individual_deduplication_summary = graphene.Field(
-        DeduplicationSummaryGQLType,
+        IndividualDeduplicationSummaryGQLType,
         columns=graphene.List(graphene.String, required=True),
-        location_id=graphene.String(required=False),
+        location=graphene.UUID(required=False),
     )
+    individual_deduplication_fields = graphene.List(graphene.String)
 
     # -------------------------------
     # REQUIRED by ExportableQueryMixin
@@ -334,10 +340,14 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
             )
 
         is_tasaf_beneficiary = kwargs.get("isTasafBeneficiary")
-        if is_tasaf_beneficiary is True:
-            filters.append(Q(is_deleted=False) & Q(beneficiary__benefit_plan_id__isnull=False))
-        elif is_tasaf_beneficiary is False:
-            filters.append(Q(is_deleted=False) & Q(beneficiary__benefit_plan_id__isnull=True))
+        if is_tasaf_beneficiary is not None:
+            from social_protection.models import GroupBeneficiary
+            enrolled = Q(beneficiary__benefit_plan_id__isnull=False) | Q(Exists(GroupBeneficiary.objects.filter(
+                is_deleted=False, group__is_deleted=False,
+                group__groupindividuals__individual_id=OuterRef("pk"),
+                group__groupindividuals__is_deleted=False,
+            )))
+            filters.append(Q(is_deleted=False) & (enrolled if is_tasaf_beneficiary else ~enrolled))
 
         filter_not_attached_to_group = kwargs.get("filterNotAttachedToGroup")
         if filter_not_attached_to_group:
@@ -410,6 +420,17 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         if apply_individual_consent_filter:
             query = apply_non_consented_filter(query, is_non_consented)
 
+        for word in (kwargs.get("headName") or "").split():
+            query = query.filter(Q(first_name__icontains=word) | Q(last_name__icontains=word))
+
+        interview_key = "".join((kwargs.get("interviewKey") or "").split()).replace("-", "")
+        if interview_key:
+            query = query.annotate(
+                interview_key_digits=Replace(
+                    KeyTextTransform("interview_key", "json_ext"), Value("-"), Value(""), output_field=TextField()
+                )
+            ).filter(interview_key_digits__icontains=interview_key)
+
         # OPTIMIZATION: Add explicit relationship loading for better performance with 10M+ data
         query = query.select_related('location')
 
@@ -424,7 +445,12 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
 
         return gql_optimizer.query(query, info)
 
-    def resolve_individual_deduplication_summary(self, info, columns=None, location_id=None, **kwargs):
+    def resolve_individual_deduplication_fields(self, info, **kwargs):
+        from individual.services import deduplication_fields
+        Query._check_permissions(info.context.user, IndividualConfig.gql_individual_search_perms)
+        return deduplication_fields()
+
+    def resolve_individual_deduplication_summary(self, info, columns=None, location=None, **kwargs):
         from individual.services import get_individual_duplication_aggregation
         import logging
 
@@ -436,19 +462,19 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
                 IndividualConfig.gql_individual_search_perms
             )
 
-            logger.debug(f"Dedup summary query - columns: {columns}, location_id: {location_id}")
+            logger.debug(f"Dedup summary query - columns: {columns}, location: {location}")
 
-            results = get_individual_duplication_aggregation(columns, location_id)
+            result = get_individual_duplication_aggregation(columns, location)
             rows = [
                 DeduplicationSummaryRowGQLType(
                     count=row.get("count"),
                     ids=row.get("ids"),
                     column_values=row.get("column_values", {}),
                 )
-                for row in results
+                for row in result['rows']
             ]
 
-            return DeduplicationSummaryGQLType(rows=rows)
+            return IndividualDeduplicationSummaryGQLType(rows=rows, total=result['total'], limit=result['limit'])
         except Exception as e:
             logger.error(f"Error in resolve_individual_deduplication_summary: {str(e)}", exc_info=True)
             raise

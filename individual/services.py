@@ -762,75 +762,65 @@ class GroupAndGroupIndividualAlignmentService:
         old_primary.save(user=self.user)
 
 
-def get_individual_duplication_aggregation(columns, location_id=None):
-    """
-    Find duplicate individuals based on specified columns.
+DEDUPLICATION_MODEL_FIELDS = ("first_name", "last_name", "dob", "location__name", "location__code")
 
-    Args:
-        columns: List of field names to group by (e.g., ['first_name', 'last_name'])
-        location_id: Optional location filter (integer ID or string)
 
-    Returns:
-        List of groups with count > 1 (actual duplicates)
-    """
+class DeduplicationFieldError(ValueError):
+    pass
+
+
+def deduplication_fields():
+    return list(DEDUPLICATION_MODEL_FIELDS) + list(IndividualConfig.deduplication_json_fields or [])
+
+
+def get_individual_duplication_aggregation(columns, location=None):
     from django.contrib.postgres.aggregates import ArrayAgg
+    from django.db.models import Window
+    from django.db.models.fields.json import KeyTextTransform
+    from django.db.models.functions import Lower, Trim
 
-    raw_columns = columns
     columns = _normalize_individual_deduplication_columns(columns)
-
+    limit = IndividualConfig.deduplication_max_groups
     if not columns:
-        return []
-
-    # Separate model fields from json_ext fields
-    model_columns, json_columns = _resolve_individual_columns(columns)
-
-    if not model_columns:
-        logger.warning(
-            "Individual deduplication scan has no valid model columns. raw_columns=%s normalized_columns=%s",
-            raw_columns,
-            columns,
-        )
-        return []
+        return {'rows': [], 'total': 0, 'limit': limit}
+    unknown = [c for c in columns if c not in deduplication_fields()]
+    if unknown:
+        raise DeduplicationFieldError(f"Cannot match on: {', '.join(unknown)}")
 
     query = Individual.objects.filter(is_deleted=False)
+    if location:
+        from location.models import Location
+        place = Location.objects.filter(uuid__iexact=str(location)).values_list('id', flat=True).first()
+        query = query.filter(Q(location_id=place) | Q(location__parent_id=place)
+                             | Q(location__parent__parent_id=place)
+                             | Q(location__parent__parent__parent_id=place))
+    group_by = []
+    for col in columns:
+        if col in DEDUPLICATION_MODEL_FIELDS:
+            query = query.exclude(**{f'{col}__isnull': True})
+            if col != 'dob':
+                query = query.exclude(**{col: ''})
+            group_by.append(col)
+        else:
+            key = f'json__{col}'
+            query = query.annotate(**{key: Lower(Trim(KeyTextTransform(col, 'json_ext')))}).exclude(
+                Q(**{f'{key}__isnull': True}) | Q(**{key: ''}))
+            group_by.append(key)
 
-    # Handle location_id filtering - convert string to int if needed
-    if location_id:
-        try:
-            # location_id should be an integer, but handle string input
-            if isinstance(location_id, str):
-                location_id = int(location_id)
-            query = query.filter(location_id=location_id)
-        except (ValueError, TypeError):
-            logger.warning(f"Invalid location_id provided: {location_id}")
-            # Continue without location filter if invalid
-
-    # Group by model columns
-    grouped = query.values(*model_columns).annotate(
-        count=Count('id'),
-        ids=ArrayAgg('id')
-    ).filter(count__gt=1)
-
-    # Format results
-    results = []
+    grouped = (query.values(*group_by)
+               .annotate(count=Count('id'), ids=ArrayAgg('id'), total=Window(Count('*')))
+               .filter(count__gt=1)
+               .order_by('-count', *group_by)[:limit])
+    rows, total = [], 0
     for group in grouped:
-        results.append({
+        total = group['total']
+        rows.append({
             'count': group['count'],
             'ids': [str(id_) for id_ in group['ids']],
-            'column_values': {
-                col: _serialize_deduplication_column_value(group.get(col))
-                for col in model_columns
-            }
+            'column_values': {col: _serialize_deduplication_column_value(group[key])
+                              for col, key in zip(columns, group_by)},
         })
-
-    logger.warning(
-        "Individual deduplication scan completed. raw_columns=%s normalized_columns=%s model_columns=%s result_count=%s",
-        raw_columns,
-        columns,
-        model_columns,
-        len(results),
-    )
-    return results
+    return {'rows': rows, 'total': total, 'limit': limit}
 
 
 def _serialize_deduplication_column_value(value):
@@ -890,38 +880,6 @@ def _normalize_individual_deduplication_columns(columns):
         if column not in normalized_columns:
             normalized_columns.append(column)
     return normalized_columns
-
-
-def _resolve_individual_columns(columns):
-    """
-    Separate database model fields from json_ext fields.
-
-    Returns:
-        Tuple of (model_columns, json_columns)
-    """
-    model_columns = []
-    json_columns = []
-
-    for col in columns:
-        if _is_individual_model_column(col):
-            model_columns.append(col)
-        else:
-            json_columns.append(col)
-
-    return model_columns, json_columns
-
-
-def _is_individual_model_column(column_name):
-    """Check if a column maps to a model field on Individual.
-
-    Supports related lookups such as ``location__name`` / ``location__code``
-    by checking the first segment against the model fields.
-    """
-    try:
-        Individual._meta.get_field(str(column_name).split("__", 1)[0])
-        return True
-    except Exception:
-        return False
 
 
 class CreateDeduplicationIndividualReviewTasksService:
@@ -1006,6 +964,10 @@ class CreateDeduplicationIndividualReviewTasksService:
 
             if not normalized_summary:
                 return output_result_success({"detail": "No duplicates to process"})
+            limit = IndividualConfig.deduplication_max_groups
+            if len(normalized_summary) > limit:
+                return {"success": False, "detail": f"At most {limit} groups can be sent for review at once; "
+                                                     f"{len(normalized_summary)} were sent. Match on more fields."}
 
             created = []
             for item in normalized_summary:

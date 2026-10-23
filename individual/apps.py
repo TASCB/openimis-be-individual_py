@@ -36,6 +36,8 @@ DEFAULT_CONFIG = {
     "validation_upload_valid_items": "individual_validation.upload_valid_items",
     "validation_upload_valid_items_workflow": "individual-upload-valid-items.individual-upload-valid-items",
     "deduplication_review_event": "individual_deduplication.resolve",
+    "deduplication_json_fields": ["external_id", "interview_key", "gender"],
+    "deduplication_max_groups": 200,
     "pct_auto_enroll_enabled": True,
     "pct_auto_enroll_on_rerun": True,
     "pct_benefit_plan_code": "PCT",
@@ -98,6 +100,8 @@ class IndividualConfig(AppConfig):
     validation_upload_valid_items_workflow = None
     validation_upload_valid_items = None
     deduplication_review_event = None
+    deduplication_json_fields = None
+    deduplication_max_groups = None
     pct_auto_enroll_enabled = None
     pct_auto_enroll_on_rerun = None
     pct_benefit_plan_code = None
