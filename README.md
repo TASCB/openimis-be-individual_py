@@ -116,3 +116,9 @@ Then upload the generated csv file in the web app:
 - Choose "Python Import Individuals" as the Workflow, leave "Create groups from column:" empty, then click on UPLOAD INDIVIDUALS.
 - Go to "Task Management" > "All Tasks", find and approve the `import_valid_items` task.
 - Then you should see the list of individuals appear under "Social Protection" > "Individuals"
+
+## Survey Solutions import optimization
+
+Deploy with the matching ETL branch. See the
+[optimization and database deployment README](https://github.com/TASCB/openimis-be-api_etl_py/blob/feature/survey-solutions-import-optimization/docs/performance/README.md)
+for required migrations/indexes, deployment steps, and measured improvements.

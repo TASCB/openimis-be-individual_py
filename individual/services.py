@@ -7,11 +7,13 @@ import math
 import inspect
 import importlib
 from collections import OrderedDict
+from individual.import_performance import copy_staging, defer_reporting, measure_phase, timed_phase
 from datetime import datetime as py_datetime
 
 from simple_history.utils import bulk_create_with_history, bulk_update_with_history
 from pandas import DataFrame
 from django.core.files.uploadedfile import InMemoryUploadedFile
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
 
 from calculation.services import get_calculation_object
@@ -24,6 +26,7 @@ from django.apps import apps
 from django.utils.translation import gettext as _
 from django.db.models import Q, OuterRef, Subquery, Count
 from individual.apps import IndividualConfig
+from individual.relationship_roles import role_for_relationship
 from individual.models import (
     Individual,
     IndividualDataSource,
@@ -345,6 +348,23 @@ class GroupService(
                 model_name=self.OBJECT_TYPE.__name__, method="update", exception=exc
             )
 
+    def _adjust_update_task_data(self, entity, obj_data):
+        # individuals_data is not a Group attribute, so the default payload builder cannot read
+        # its current value; record the current members instead.
+        individuals_data = obj_data.pop("individuals_data", None)
+        payload = super()._adjust_update_task_data(entity, obj_data)
+        if individuals_data is not None:
+            payload["incoming_data"]["individuals_data"] = json.loads(
+                json.dumps(individuals_data, cls=DjangoJSONEncoder)
+            )
+            payload["current_data"]["individuals_data"] = [
+                {"individual_id": str(individual_id)}
+                for individual_id in GroupIndividual.objects.filter(
+                    group=entity, is_deleted=False
+                ).values_list("individual_id", flat=True)
+            ]
+        return payload
+
     @register_service_signal("group_service.delete")
     def delete(self, obj_data):
         # if there ever was a requirement to undo group delete, remember to use members from json_ext, you will avoid
@@ -541,7 +561,7 @@ class GroupAndGroupIndividualAlignmentService:
         if recipient_type == GroupIndividual.RecipientType.PRIMARY:
             self._change_primary(group_individual_id, group_id)
 
-    def update_json_ext_for_group(self, group, force=False):
+    def update_json_ext_for_group(self, group, force=False, links=None, save=True):
         """
         This method ensures that json_ext of a group is up-to-date with its roles and members.
         Also (non-breaking enhancement): if a HEAD exists, mirror household PMT to the group
@@ -553,16 +573,13 @@ class GroupAndGroupIndividualAlignmentService:
         if not force and group_aggregates_suppressed():
             return
 
-        group_individuals = GroupIndividual.objects.select_related("individual").filter(
-            group_id=group.id, is_deleted=False
-        )
-        head = group_individuals.filter(role=GroupIndividual.Role.HEAD).first()
-        primary = group_individuals.filter(
-            recipient_type=GroupIndividual.RecipientType.PRIMARY
-        ).first()
-        secondary = group_individuals.filter(
-            recipient_type=GroupIndividual.RecipientType.SECONDARY
-        ).first()
+        group_individuals = links if links is not None else list(
+            GroupIndividual.objects.select_related("individual").filter(
+                group_id=group.id, is_deleted=False).order_by("pk"))
+        head = next((link for link in group_individuals if link.role == GroupIndividual.Role.HEAD), None)
+        primary = next((link for link in group_individuals if link.recipient_type == GroupIndividual.RecipientType.PRIMARY), None)
+        secondary = next((link for link in group_individuals if link.recipient_type == GroupIndividual.RecipientType.SECONDARY), None)
+        original_json = json.dumps(group.json_ext, sort_keys=True, cls=DjangoJSONEncoder)
 
         group_members = {
             str(
@@ -626,9 +643,9 @@ class GroupAndGroupIndividualAlignmentService:
             p_class = None
             p_cutoff = None
             if isinstance(head_json_ext, dict):
-                p_score = head_json_ext.get("pmt_score")
-                p_class = head_json_ext.get("pmt_class")
-                p_cutoff = head_json_ext.get("pmt_cutoff_used")
+                p_score = IndividualImportService._json_ext_lookup(head_json_ext, "pmt_score")
+                p_class = IndividualImportService._json_ext_lookup(head_json_ext, "pmt_class")
+                p_cutoff = IndividualImportService._json_ext_lookup(head_json_ext, "pmt_cutoff_used")
             if (
                 (group.json_ext.get("pmt_score_household") != p_score)
                 or (group.json_ext.get("pmt_class_household") != p_class)
@@ -641,19 +658,8 @@ class GroupAndGroupIndividualAlignmentService:
         except Exception:
             logger.debug("PMT mirror to group json_ext failed", exc_info=True)
 
-        current_members = group.json_ext.get("members", {})
-        additional_members = {
-            k: v for k, v in group_members.items() if k not in current_members
-        }
-        remove_members = {
-            k: v for k, v in current_members.items() if k not in group_members
-        }
-        updated_members = {**current_members, **additional_members}
-        for member_id in remove_members:
-            updated_members.pop(member_id, None)
-
-        if current_members != updated_members:
-            changes_to_save["members"] = updated_members
+        if group.json_ext.get("members", {}) != group_members:
+            changes_to_save["members"] = group_members
 
         if group.json_ext.get("head") != head_str:
             changes_to_save["head"] = head_str
@@ -675,7 +681,10 @@ class GroupAndGroupIndividualAlignmentService:
 
         if changes_to_save:
             group.json_ext.update(changes_to_save)
+        changed = original_json != json.dumps(group.json_ext, sort_keys=True, cls=DjangoJSONEncoder)
+        if changed and save:
             group.save(update_fields=["json_ext"], user=self.user)
+        return changed
 
     def handle_assure_primary_recipient_in_group(self, group, recipient_type):
         """
@@ -1248,42 +1257,8 @@ class IndividualImportService:
 
     @classmethod
     def _group_individual_role_from_relationship(cls, relationship_to_head, gender):
-        relationship_code = str(relationship_to_head or "").strip()
-        normalized_gender = str(gender or "").strip().upper()
-
-        if not relationship_code:
-            return None
-        if relationship_code == "1":
-            return GroupIndividual.Role.HEAD
-        if relationship_code in ("2", "12"):
-            return GroupIndividual.Role.SPOUSE
-        if relationship_code in ("3", "4"):
-            if normalized_gender == "M":
-                return GroupIndividual.Role.SON
-            if normalized_gender == "F":
-                return GroupIndividual.Role.DAUGHTER
-            return GroupIndividual.Role.OTHER_RELATIVE
-        if relationship_code == "5":
-            if normalized_gender == "M":
-                return GroupIndividual.Role.BROTHER
-            if normalized_gender == "F":
-                return GroupIndividual.Role.SISTER
-            return GroupIndividual.Role.OTHER_RELATIVE
-        if relationship_code == "6":
-            if normalized_gender == "M":
-                return GroupIndividual.Role.GRANDSON
-            if normalized_gender == "F":
-                return GroupIndividual.Role.GRANDDAUGHTER
-            return GroupIndividual.Role.OTHER_RELATIVE
-        if relationship_code == "7":
-            if normalized_gender == "M":
-                return GroupIndividual.Role.FATHER
-            if normalized_gender == "F":
-                return GroupIndividual.Role.MOTHER
-            return GroupIndividual.Role.OTHER_RELATIVE
-        if relationship_code == "14":
-            return GroupIndividual.Role.NOT_RELATED
-        return GroupIndividual.Role.OTHER_RELATIVE
+        role = role_for_relationship(relationship_to_head, gender)
+        return GroupIndividual.Role(role) if role else None
 
     @classmethod
     def _group_individual_role_from_json_ext(cls, json_ext):
@@ -1362,6 +1337,7 @@ class IndividualImportService:
         return {"success": True, "data": {"upload_uuid": upload.uuid}}
 
     @transaction.atomic
+    @timed_phase("prepare_upload_seconds")
     def _save_sources(self, import_file):
         # Method separated as workflow execution must be independent of the atomic transaction.
         upload = self._create_upload_entry(import_file.name)
@@ -1392,13 +1368,17 @@ class IndividualImportService:
             "summary_invalid_items": invalid_items,
         }
 
-    def synchronize_data_for_reporting(self, upload_id: uuid):
+    def synchronize_data_for_reporting(self, upload_id: uuid, _flush=False):
+        if not _flush and defer_reporting(upload_id):
+            return
         if "opensearch_reports" in apps.app_configs:
             from individual.documents import IndividualDocument
 
-            individuals = Individual.objects.filter(
-                individualdatasource__upload=upload_id
-            )
+            source_ids = IndividualDataSource.objects.filter(
+                upload_id__in=(upload_id if isinstance(upload_id, list) else [upload_id]),
+                is_deleted=False, individual_id__isnull=False
+            ).values("individual_id")
+            individuals = Individual.objects.filter(pk__in=source_ids, is_deleted=False)
             if not individuals:
                 return
 
@@ -1661,6 +1641,7 @@ class IndividualImportService:
     #         raise ValueError("Unsupported content type: {}".format(import_file.content_type))
     #     return self.import_loaders[import_file.content_type](import_file)
 
+    @timed_phase("staging_seconds")
     def _save_data_source(
         self, dataframe: pd.DataFrame, upload: IndividualDataSourceUpload
     ):
@@ -1677,9 +1658,7 @@ class IndividualImportService:
         """
         data_source_objects = []
 
-        for _, row in dataframe.iterrows():
-            # Convert row to a plain python dict (safe for JSON dumps/loads)
-            row_dict = json.loads(row.to_json())
+        for row_dict in json.loads(dataframe.to_json(orient="records")):
 
             # ---- FIX: parse json_ext string -> dict and inline it properly ----
             jx = row_dict.get("json_ext")
@@ -1722,8 +1701,10 @@ class IndividualImportService:
             )
             data_source_objects.append(ds)
 
-        IndividualDataSource.objects.bulk_create(data_source_objects)
+        with measure_phase("staging_write_seconds"):
+            copy_staging(IndividualDataSource, data_source_objects)
 
+    @timed_phase("workflow_seconds")
     def _trigger_workflow(
         self, workflow: WorkflowHandler, upload: IndividualDataSourceUpload
     ):
@@ -1821,6 +1802,7 @@ class IndividualImportService:
                 new_primary.role = GroupIndividual.Role.HEAD
             _mark(new_primary)
 
+    @timed_phase("group_linking_seconds")
     def link_groups_for_upload_uuid(self, upload_uuid: str) -> dict:
         """
         Create/align Groups and GroupIndividuals for all Individuals created by this upload.
@@ -1859,9 +1841,12 @@ class IndividualImportService:
             if isinstance(c, str) and c.strip():
                 group_col = c.strip()
 
+        source_individual_ids = IndividualDataSource.objects.filter(
+            upload=upload, is_deleted=False, individual_id__isnull=False
+        ).values("individual_id")
         inds = list(Individual.objects.filter(
-            individualdatasource__upload=upload, is_deleted=False
-        ).distinct())
+            pk__in=source_individual_ids, is_deleted=False
+        ))
         inds.sort(key=self._group_link_sort_key)
 
         if not inds:
@@ -1909,12 +1894,16 @@ class IndividualImportService:
                     code__in=list(households.keys()), is_deleted=False
                 )
             }
+            new_groups = []
             for group_code in households:
                 if group_code not in groups_by_code:
-                    grp = Group(code=group_code, json_ext={})
-                    grp.save(user=self.user)
+                    grp = Group(id=uuid.uuid4(), code=group_code, json_ext={},
+                                user_created=self.user, user_updated=self.user)
                     groups_by_code[group_code] = grp
-                    created_groups += 1
+                    new_groups.append(grp)
+            if new_groups:
+                bulk_create_with_history(new_groups, Group, batch_size=1000, default_user=self.user)
+            created_groups = len(new_groups)
 
             group_ids = [g.id for g in groups_by_code.values()]
             existing_links = {
@@ -2016,9 +2005,9 @@ class IndividualImportService:
 
                     try:
                         if desired_role == GroupIndividual.Role.HEAD:
-                            pmt_score = jx.get("pmt_score")
-                            pmt_class = jx.get("pmt_class")
-                            pmt_cutoff_used = jx.get("pmt_cutoff_used")
+                            pmt_score = self._json_ext_lookup(jx, "pmt_score")
+                            pmt_class = self._json_ext_lookup(jx, "pmt_class")
+                            pmt_cutoff_used = self._json_ext_lookup(jx, "pmt_cutoff_used")
                             if pmt_score is not None or pmt_class is not None or pmt_cutoff_used is not None:
                                 upd = False
                                 if grp.json_ext is None:
@@ -2042,7 +2031,7 @@ class IndividualImportService:
                                     grp.json_ext["pmt_cutoff_used"] = pmt_cutoff_used
                                     upd = True
                                 if upd:
-                                    grp.save(update_fields=["json_ext"], user=self.user)
+                                    groups_to_save[grp.id] = grp
                     except Exception:
                         pass
 
@@ -2058,8 +2047,6 @@ class IndividualImportService:
                     batch_size=1000,
                     default_user=self.user,
                 )
-            for g in groups_to_save.values():
-                g.save(user=self.user)
             if new_links:
                 bulk_create_with_history(
                     new_links, GroupIndividual, batch_size=1000, default_user=self.user
@@ -2074,16 +2061,40 @@ class IndividualImportService:
                     default_user=self.user,
                 )
 
-            # force=True: the per-save rebuild is suppressed above.
-            for gid in touched_groups:
-                try:
-                    g = Group.objects.get(id=gid)
-                    aligner.update_json_ext_for_group(g, force=True)
-                except Exception:
-                    logger.exception(
-                        "Failed to refresh group.json_ext aggregates for group %s; "
-                        "its members/head/PMT summary may be stale.", gid
-                    )
+            # Fetch every touched household's links once, then save summaries in bulk.
+            with measure_phase("group_aggregation_seconds"):
+                links_by_group = {}
+                groups_by_id = {group.id: group for group in groups_by_code.values()}
+                aligned_individuals = {}
+                for link in GroupIndividual.objects.select_related("individual").filter(
+                    group_id__in=touched_groups, is_deleted=False).order_by("pk"):
+                    group = groups_by_id[link.group_id]
+                    # Preserve Group.post_save's location alignment for members from
+                    # earlier uploads as well as the members in the current batch.
+                    if group.location_id and link.individual.location_id != group.location_id:
+                        person = link.individual
+                        person.location_id = group.location_id
+                        person.version += 1
+                        person.date_updated = py_datetime.now()
+                        person.user_updated = self.user
+                        aligned_individuals[person.id] = person
+                    links_by_group.setdefault(link.group_id, []).append(link)
+                if aligned_individuals:
+                    bulk_update_with_history(list(aligned_individuals.values()), Individual,
+                        ["location", "version", "date_updated", "user_updated"],
+                        batch_size=1000, default_user=self.user)
+                for group in groups_by_code.values():
+                    if aligner.update_json_ext_for_group(group, force=True,
+                            links=links_by_group.get(group.id, []), save=False):
+                        groups_to_save[group.id] = group
+                if groups_to_save:
+                    for group in groups_to_save.values():
+                        group.version += 1
+                        group.date_updated = py_datetime.now()
+                        group.user_updated = self.user
+                    bulk_update_with_history(list(groups_to_save.values()), Group,
+                        ["location", "json_ext", "version", "date_updated", "user_updated"],
+                        batch_size=1000, default_user=self.user)
 
         return {
             "success": True,
