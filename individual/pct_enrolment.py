@@ -1,7 +1,7 @@
 import logging
 import uuid
 
-from django.db import transaction
+from django.db import connection, transaction
 from django.utils import timezone
 
 from individual.apps import IndividualConfig
@@ -97,7 +97,9 @@ class PctEnrolmentService:
         code = str(district_code)
 
         with transaction.atomic():
-            all_open = list(Task.objects.select_for_update().filter(
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", [f"pct_enrolment:{code}"])
+            all_open = list(Task.objects.filter(
                 is_deleted=False,
                 business_event=IndividualConfig.pct_enrolment_task_event,
                 status__in=[Task.Status.RECEIVED, Task.Status.ACCEPTED],
@@ -128,9 +130,9 @@ class PctEnrolmentService:
             )
             upload.save(user=self.user)
             self._stage(upload.id, heads, code)
-        if not IndividualConfig.enable_maker_checker_for_pct_enrolment:
-            return self.enrol_upload(upload.id)
-        return self._create_task(upload.id, len(heads), district_code=code)
+            if not IndividualConfig.enable_maker_checker_for_pct_enrolment:
+                return self.enrol_upload(upload.id)
+            return self._create_task(upload.id, len(heads), district_code=code)
 
     def _stage(self, upload_id, heads, district_code):
         IndividualDataSource.objects.bulk_create([
