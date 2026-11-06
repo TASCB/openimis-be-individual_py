@@ -1214,6 +1214,8 @@ class IndividualImportService:
         if not isinstance(json_ext, dict):
             return None
         candidates = [json_ext]
+        if isinstance(json_ext.get("raw"), dict):
+            candidates.append(json_ext["raw"])
         nested = json_ext.get("json_ext")
         if isinstance(nested, dict):
             candidates.append(nested)
@@ -1603,61 +1605,14 @@ class IndividualImportService:
 
         return df
 
-    # def _load_import_file(self, import_file) -> pd.DataFrame:
-    #     if import_file.content_type not in self.import_loaders:
-    #         raise ValueError("Unsupported content type: {}".format(import_file.content_type))
-    #     return self.import_loaders[import_file.content_type](import_file)
-
     def _save_data_source(
         self, dataframe: pd.DataFrame, upload: IndividualDataSourceUpload
     ):
-        """
-        Save each uploaded row as IndividualDataSource.json_ext.
-
-        Key fix:
-        - If the incoming dataframe has a 'json_ext' column, it often contains a JSON STRING
-        (because ETL writes json_ext as serialized JSON in the CSV).
-        - If we store it as-is, we end up with:
-            {"json_ext": "{...string...}", ...}
-        which later propagates to Individual.Json_ext and causes json_ext->'json_ext' to be a string.
-        - Here we parse that string into a dict and merge it into the row payload.
-        """
+        """Save each uploaded row as IndividualDataSource.json_ext."""
         data_source_objects = []
 
         for _, row in dataframe.iterrows():
-            # Convert row to a plain python dict (safe for JSON dumps/loads)
-            row_dict = json.loads(row.to_json())
-
-            # ---- FIX: parse json_ext string -> dict and inline it properly ----
-            jx = row_dict.get("json_ext")
-
-            if isinstance(jx, str):
-                # Sometimes pandas stores NaN-like values as "nan" string
-                jx_str = jx.strip()
-                if jx_str and jx_str.lower() not in ("nan", "none", "null"):
-                    try:
-                        parsed = json.loads(jx_str)
-                        if isinstance(parsed, dict):
-                            row_dict["json_ext"] = parsed
-                        else:
-                            # If it's valid JSON but not an object, keep as empty object
-                            row_dict["json_ext"] = {}
-                    except Exception:
-                        # If parsing fails, keep an empty object rather than a broken string
-                        row_dict["json_ext"] = {}
-                else:
-                    row_dict["json_ext"] = {}
-
-            elif jx is None:
-                row_dict["json_ext"] = {}
-
-            # If already dict, keep it as-is
-            if not isinstance(row_dict.get("json_ext"), dict):
-                row_dict["json_ext"] = {}
-
-            # ---- OPTIONAL: ensure 'raw' is preserved if present (no overwrite) ----
-            # (Do nothing special here; we store whatever is inside row_dict["json_ext"].
-            # Your ETL already puts questionnaire variables in json_ext["raw"].)
+            row_dict = self._flatten_json_ext_column(json.loads(row.to_json()))
 
             ds = IndividualDataSource(
                 upload=upload,
@@ -1670,6 +1625,24 @@ class IndividualImportService:
             data_source_objects.append(ds)
 
         IndividualDataSource.objects.bulk_create(data_source_objects)
+
+    @classmethod
+    def _flatten_json_ext_column(cls, row_dict):
+        extra = cls._parse_json_ext_column(row_dict.pop("json_ext", None))
+        columns = {k: v for k, v in row_dict.items() if v not in (None, "") or k not in extra}
+        return {**extra, **columns}
+
+    @staticmethod
+    def _parse_json_ext_column(value):
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip().lower() not in ("", "nan", "none", "null"):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
 
     def _trigger_workflow(
         self, workflow: WorkflowHandler, upload: IndividualDataSourceUpload

@@ -33,7 +33,8 @@ def _json_ext_payload(ext):
     nested = ext.get("json_ext") or ext.get("jsonExt")
 
     if isinstance(nested, dict):
-        return nested
+        top = {k: v for k, v in ext.items() if k not in ("json_ext", "jsonExt")}
+        return {**nested, **top}
 
     return ext
 

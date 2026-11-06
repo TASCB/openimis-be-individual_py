@@ -577,35 +577,8 @@ class PmtService(BaseService):
                     if not head:
                         continue
 
-                    # Prepare household data from HEAD's json_ext
-                    head_json_ext = head.json_ext or {}
-                    head.json_ext = head_json_ext
-                    raw_data = head_json_ext.get("raw") or {}
-
-                    # Extract fields with validation
-                    assets = head_json_ext.get("assets_owned") or raw_data.get("assets_owned")
-                    settlement = head_json_ext.get("settlement_type") or raw_data.get("settlement_type")
-
-                    # Log warnings for missing data
-                    if not assets:
-                        logger.warning(
-                            f"Missing assets_owned for group {group.code} - "
-                            f"household may be underestimated in poverty assessment"
-                        )
-                        assets = []  # Empty list means 0 indicators for all asset coefficients
-
-                    if not settlement:
-                        logger.warning(
-                            f"Missing settlement_type for group {group.code} - "
-                            f"defaulting to rural for PMT calculation"
-                        )
-                        settlement = "rural"
-
-                    hh_data = {
-                        "household_size": len(members),
-                        "assets_owned": assets,
-                        "settlement_type": settlement,
-                    }
+                    head.json_ext = head.json_ext or {}
+                    hh_data = {**head.json_ext, "household_size": len(members)}
 
                     # Prepare members list with dob
                     members_data = [{"dob": m.dob} for m in members]
