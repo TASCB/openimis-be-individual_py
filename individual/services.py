@@ -1610,9 +1610,13 @@ class IndividualImportService:
     ):
         """Save each uploaded row as IndividualDataSource.json_ext."""
         data_source_objects = []
+        payload_fields = set()
 
         for _, row in dataframe.iterrows():
-            row_dict = self._flatten_json_ext_column(json.loads(row.to_json()))
+            row_dict = json.loads(row.to_json())
+            extra = self._parse_json_ext_column(row_dict.pop("json_ext", None))
+            payload_fields.update(extra)
+            row_dict = self._merge_json_ext_payload(row_dict, extra)
 
             ds = IndividualDataSource(
                 upload=upload,
@@ -1625,10 +1629,21 @@ class IndividualImportService:
             data_source_objects.append(ds)
 
         IndividualDataSource.objects.bulk_create(data_source_objects)
+        self._record_payload_fields(upload, payload_fields - set(dataframe.columns))
+
+    @staticmethod
+    def _record_payload_fields(upload, fields):
+        if not fields:
+            return
+        upload.json_ext = {**(upload.json_ext or {}), "payload_fields": sorted(fields)}
+        IndividualDataSourceUpload.objects.filter(id=upload.id).update(json_ext=upload.json_ext)
 
     @classmethod
     def _flatten_json_ext_column(cls, row_dict):
-        extra = cls._parse_json_ext_column(row_dict.pop("json_ext", None))
+        return cls._merge_json_ext_payload(row_dict, cls._parse_json_ext_column(row_dict.pop("json_ext", None)))
+
+    @staticmethod
+    def _merge_json_ext_payload(row_dict, extra):
         columns = {k: v for k, v in row_dict.items() if v not in (None, "") or k not in extra}
         return {**extra, **columns}
 

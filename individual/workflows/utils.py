@@ -11,7 +11,7 @@ from django.db import ProgrammingError, connection
 
 from core.models import User
 from individual.apps import IndividualConfig
-from individual.models import IndividualDataSource
+from individual.models import IndividualDataSource, IndividualDataSourceUpload
 from individual.services import IndividualImportService
 from individual.utils import load_dataframe
 from workflow.exceptions import PythonWorkflowHandlerException
@@ -45,6 +45,11 @@ class BasePythonWorkflowExecutor(metaclass=ABCMeta):
                 "It'll be removed from upload."
             )
         return df
+
+    def _payload_fields(self):
+        upload_json = IndividualDataSourceUpload.objects.filter(
+            id=self.upload_uuid).values_list("json_ext", flat=True).first()
+        return (upload_json or {}).get("payload_fields", [])
 
     def validate_dataframe_headers(self, is_update=False):
         """
@@ -83,6 +88,7 @@ class BasePythonWorkflowExecutor(metaclass=ABCMeta):
                 "location_code",
             ]
         )
+        schema_properties.update(self._payload_fields())
         required_headers = set(IndividualConfig.individual_base_fields)
         if is_update:
             required_headers.add("ID")

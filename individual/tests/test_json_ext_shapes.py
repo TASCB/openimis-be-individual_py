@@ -1,5 +1,12 @@
 from unittest import TestCase
 
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase as DjangoTestCase
+
+from core.test_helpers import LogInHelper
+from individual.workflows.utils import SqlProcedurePythonWorkflow
+from workflow.exceptions import PythonWorkflowHandlerException
+
 from individual.gql_queries import _json_ext_payload, _json_ext_raw
 from individual.services import IndividualImportService
 
@@ -45,3 +52,25 @@ class JsonExtPayloadTest(TestCase):
         ext = {"consent_res": "2", "raw": {"b": 2}}
         self.assertIs(_json_ext_payload(ext), ext)
         self.assertEqual(_json_ext_raw(ext), {"b": 2})
+
+
+class PayloadFieldsPassHeaderCheckTest(DjangoTestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = LogInHelper().get_or_create_user_api(username="payloadfields")
+
+    def _upload(self, header, row):
+        csv_file = SimpleUploadedFile("payload.csv", f"{header}\n{row}\n".encode(), content_type="text/csv")
+        return IndividualImportService(self.user)._save_sources(csv_file)
+
+    def test_json_ext_keys_are_accepted_but_unknown_columns_are_not(self):
+        upload = self._upload(
+            "first_name,last_name,dob,location_name,location_code,json_ext",
+            'A,B,1980-01-01,X,1,"{""raw"": {""hh_size"": ""4""}, ""pmt_cutoff_used"": 11.01}"',
+        )
+        self.assertEqual(upload.json_ext["payload_fields"], ["pmt_cutoff_used", "raw"])
+        SqlProcedurePythonWorkflow(upload.id, self.user.id).validate_dataframe_headers()
+
+        bad = self._upload("first_name,last_name,dob,location_name,location_code,typo_column", "A,B,1980-01-01,X,1,x")
+        with self.assertRaises(PythonWorkflowHandlerException):
+            SqlProcedurePythonWorkflow(bad.id, self.user.id).validate_dataframe_headers()
