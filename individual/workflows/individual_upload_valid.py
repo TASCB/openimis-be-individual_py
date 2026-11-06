@@ -111,9 +111,11 @@ BEGIN
     -- Keep candidates small: UUIDs and location only. Read the payload once during
     -- INSERT so repeated candidate scans cannot spill large interview JSON to disk.
     -- Retain the staging UUID so linking uses row identity, not whole JSON equality.
-    -- 1) INSERT brand-new Individuals (skip if external_id already exists)
+    -- 1) INSERT brand-new Individuals: a row repeated in the upload (same external_id, first name, dob) once;
+    --    skip if the external_id already exists
     WITH candidates AS MATERIALIZED (
-        SELECT gen_random_uuid() AS individual_uuid, ds."UUID" AS source_uuid,
+        SELECT DISTINCT ON (coalesce(lower(NULLIF(btrim(ds."Json_ext"->>'external_id'), '')) || '|' || lower(coalesce(btrim(ds."Json_ext"->>'first_name'), '')) || '|' || coalesce(btrim(ds."Json_ext"->>'dob'), ''), ds."UUID"::text))
+               gen_random_uuid() AS individual_uuid, ds."UUID" AS source_uuid,
                loc."LocationId" AS location_id
 
         FROM individual_individualdatasource AS ds
@@ -133,6 +135,7 @@ BEGIN
                       lower(NULLIF(btrim(ds."Json_ext"->>'external_id'), ''))
                   AND NULLIF(btrim(ds."Json_ext"->>'external_id'), '') IS NOT NULL
           )
+        ORDER BY coalesce(lower(NULLIF(btrim(ds."Json_ext"->>'external_id'), '')) || '|' || lower(coalesce(btrim(ds."Json_ext"->>'first_name'), '')) || '|' || coalesce(btrim(ds."Json_ext"->>'dob'), ''), ds."UUID"::text), ds."UUID"
     ), new_entry AS (
         INSERT INTO individual_individual(
             "UUID", "isDeleted", version, "UserCreatedUUID", "UserUpdatedUUID",
@@ -245,7 +248,8 @@ BEGIN
 
         -- 1) INSERT brand-new Individuals (only accepted rows)
         WITH candidates AS MATERIALIZED (
-        SELECT gen_random_uuid() AS individual_uuid, ds."UUID" AS source_uuid,
+        SELECT DISTINCT ON (coalesce(lower(NULLIF(btrim(ds."Json_ext"->>'external_id'), '')) || '|' || lower(coalesce(btrim(ds."Json_ext"->>'first_name'), '')) || '|' || coalesce(btrim(ds."Json_ext"->>'dob'), ''), ds."UUID"::text))
+               gen_random_uuid() AS individual_uuid, ds."UUID" AS source_uuid,
                loc."LocationId" AS location_id
 
             FROM individual_individualdatasource AS ds
@@ -266,6 +270,7 @@ BEGIN
                           lower(NULLIF(btrim(ds."Json_ext"->>'external_id'), ''))
                       AND NULLIF(btrim(ds."Json_ext"->>'external_id'), '') IS NOT NULL
               )
+        ORDER BY coalesce(lower(NULLIF(btrim(ds."Json_ext"->>'external_id'), '')) || '|' || lower(coalesce(btrim(ds."Json_ext"->>'first_name'), '')) || '|' || coalesce(btrim(ds."Json_ext"->>'dob'), ''), ds."UUID"::text), ds."UUID"
         ), new_entry AS (
         INSERT INTO individual_individual(
                 "UUID", "isDeleted", version, "UserCreatedUUID", "UserUpdatedUUID",
