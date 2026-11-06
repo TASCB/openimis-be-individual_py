@@ -27,6 +27,7 @@ class Command(BaseCommand):
         parser.add_argument("--cutoff", type=float, help="Defaults to the active formula cutoff")
         parser.add_argument("--batch-size", type=int, default=2000)
         parser.add_argument("--username", default="Admin")
+        parser.add_argument("--raise-pct-tasks", action="store_true", help="Raise one PCT enrolment task per district")
         parser.add_argument("--dry-run", action="store_true")
 
     def handle(self, *args, **options):
@@ -50,6 +51,12 @@ class Command(BaseCommand):
         totals = Counter()
         for code in districts:
             result = self._district(code, coeffs, cutoff, user, options, compute_household_pmt_score, survey_answers)
+            if options["raise_pct_tasks"] and not options["dry_run"]:
+                from individual.pct_enrolment import PctEnrolmentService
+
+                task = PctEnrolmentService(user).raise_for_district(code) or {}
+                if task.get("data") or task.get("added"):
+                    result["pct_tasks"] += 1
             totals.update(result)
             self.stdout.write(f"{code}: {dict(result)}")
         self.stdout.write(self.style.SUCCESS(f"Total: {dict(totals)}"))

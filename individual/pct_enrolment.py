@@ -1,4 +1,5 @@
 import logging
+import uuid
 
 from django.db import transaction
 from django.utils import timezone
@@ -10,6 +11,7 @@ from individual.models import Group, GroupIndividual, IndividualDataSource, Indi
 logger = logging.getLogger(__name__)
 
 TASK_SOURCE = "pct_enrolment"
+DISTRICT_SOURCE_TYPE = "pct enrolment district"
 
 
 def upload_enrolment_candidates(upload_id):
@@ -27,6 +29,31 @@ def upload_enrolment_candidates(upload_id):
         .exclude(non_consented_household_q())
         .exclude(pct_enrolled_q())
     )
+
+
+def district_enrolment_candidates(district_code):
+    from individual.pmt_service import PmtService
+
+    groups = Group.objects.filter(
+        is_deleted=False, location_id__in=PmtService._location_and_descendant_ids(district_code),
+    )
+    return (
+        filter_by_pmt_class(groups, "POOR")
+        .exclude(non_consented_household_q())
+        .exclude(pct_enrolled_q())
+    )
+
+
+def district_codes(groups):
+    from location.models import Location
+
+    location_ids = set(groups.values_list("location_id", flat=True)) - {None}
+    codes = set()
+    while location_ids:
+        rows = Location.objects.filter(id__in=location_ids).values_list("type", "code", "parent_id")
+        codes |= {code for type_, code, _ in rows if type_ == "D"}
+        location_ids = {parent for type_, _, parent in rows if type_ != "D" and parent}
+    return sorted(codes)
 
 
 def pct_programme_exists():
@@ -54,31 +81,90 @@ class PctEnrolmentService:
             )
             return {"success": False, "detail": "pct_benefit_plan_not_found"}
         candidates = upload_enrolment_candidates(upload_id)
-        households = candidates.count()
-        if not households:
+        if not candidates.exists():
             return None
         if not IndividualConfig.enable_maker_checker_for_pct_enrolment:
             return self.enrol_upload(upload_id)
-        return self._create_task(upload_id, candidates, households)
+        return {code: self.raise_for_district(code) for code in district_codes(candidates)}
 
-    def _create_task(self, upload_id, candidates, households):
+    def raise_for_district(self, district_code, dry_run=False):
+        from tasks_management.models import Task
+
+        if not IndividualConfig.pct_auto_enroll_enabled:
+            return {"success": False, "detail": "pct_auto_enroll_disabled"}
+        if not pct_programme_exists():
+            return {"success": False, "detail": "pct_benefit_plan_not_found"}
+        code = str(district_code)
+
+        with transaction.atomic():
+            all_open = list(Task.objects.select_for_update().filter(
+                is_deleted=False,
+                business_event=IndividualConfig.pct_enrolment_task_event,
+                status__in=[Task.Status.RECEIVED, Task.Status.ACCEPTED],
+            ))
+            open_tasks = [t for t in all_open if (t.json_ext or {}).get("district_code") == code]
+            staged = IndividualDataSource.objects.filter(
+                upload_id__in=[(t.json_ext or {}).get("upload_id") for t in all_open],
+            ).values("individual_id")
+            heads = list(GroupIndividual.objects.filter(
+                is_deleted=False, role=GroupIndividual.Role.HEAD,
+                group_id__in=district_enrolment_candidates(code).values("id"),
+            ).exclude(individual_id__in=staged).values_list("individual_id", "group_id"))
+            receiving = next((t for t in open_tasks if t.status == Task.Status.RECEIVED), None)
+
+            if not heads or dry_run:
+                result = {"success": True, "households": len(heads), "dry_run": dry_run}
+                if open_tasks and not heads:
+                    result.update(existing=True, task_id=str(open_tasks[0].id))
+                return result
+            if receiving:
+                self._stage(receiving.json_ext["upload_id"], heads, code)
+                return self._refresh_task(receiving, added=len(heads))
+
+            upload = IndividualDataSourceUpload(
+                source_name=f"PCT enrolment, district {code}, {timezone.now():%Y-%m-%d}",
+                source_type=DISTRICT_SOURCE_TYPE,
+                status=IndividualDataSourceUpload.Status.SUCCESS,
+            )
+            upload.save(user=self.user)
+            self._stage(upload.id, heads, code)
+        if not IndividualConfig.enable_maker_checker_for_pct_enrolment:
+            return self.enrol_upload(upload.id)
+        return self._create_task(upload.id, len(heads), district_code=code)
+
+    def _stage(self, upload_id, heads, district_code):
+        IndividualDataSource.objects.bulk_create([
+            IndividualDataSource(
+                id=uuid.uuid4(), upload_id=upload_id, individual_id=individual_id,
+                json_ext={"group_id": str(group_id), "district_code": district_code},
+                validations={}, user_created=self.user, user_updated=self.user,
+            )
+            for individual_id, group_id in heads
+        ])
+
+    @staticmethod
+    def _staged_counts(upload_id):
+        group_ids = GroupIndividual.objects.filter(
+            is_deleted=False, role=GroupIndividual.Role.HEAD,
+            individual_id__in=IndividualDataSource.objects.filter(upload_id=upload_id).values("individual_id"),
+        ).values("group_id")
+        households = IndividualDataSource.objects.filter(upload_id=upload_id).count()
+        members = GroupIndividual.objects.filter(is_deleted=False, group_id__in=group_ids).count()
+        return households, members
+
+    def _refresh_task(self, task, added):
+        households, members = self._staged_counts(task.json_ext["upload_id"])
+        task.json_ext = {**task.json_ext, "households": households, "members": members}
+        task.save(user=self.user)
+        return {"success": True, "task_id": str(task.id), "added": added, "households": households}
+
+    def _create_task(self, upload_id, households, district_code):
         from tasks_management.apps import TasksManagementConfig
         from tasks_management.models import Task
         from tasks_management.services import TaskService
 
-        open_task = Task.objects.filter(
-            is_deleted=False,
-            business_event=IndividualConfig.pct_enrolment_task_event,
-            json_ext__upload_id=str(upload_id),
-            status__in=[Task.Status.RECEIVED, Task.Status.ACCEPTED],
-        ).first()
-        if open_task:
-            return {"success": True, "task_id": str(open_task.id), "existing": True}
-
         upload = IndividualDataSourceUpload.objects.get(id=upload_id)
-        members = GroupIndividual.objects.filter(
-            is_deleted=False, group_id__in=candidates.values("id"),
-        ).count()
+        _, members = self._staged_counts(upload_id)
         return TaskService(self.user).create({
             "source": TASK_SOURCE,
             "entity": upload,
@@ -91,6 +177,7 @@ class PctEnrolmentService:
                 "households": households,
                 "members": members,
                 "benefit_plan_code": IndividualConfig.pct_benefit_plan_code,
+                "district_code": district_code,
             },
         })
 
