@@ -108,18 +108,14 @@ BEGIN
       AND ds."isDeleted" = False
       AND COALESCE(ds.validations ->> 'validation_errors', '[]') <> '[]';
 
+    -- Keep candidates small: UUIDs and location only. Read the payload once during
+    -- INSERT so repeated candidate scans cannot spill large interview JSON to disk.
+    -- Retain the staging UUID so linking uses row identity, not whole JSON equality.
     -- 1) INSERT brand-new Individuals (skip if external_id already exists)
-    WITH new_entry AS (
-        INSERT INTO individual_individual(
-            "UUID", "isDeleted", version, "UserCreatedUUID", "UserUpdatedUUID",
-            "Json_ext", first_name, last_name, dob, location_id
-        )
-        SELECT gen_random_uuid(), false, 1, userUUID, userUUID,
-               ds."Json_ext",
-               ds."Json_ext"->>'first_name',
-               ds."Json_ext"->>'last_name',
-               to_date(ds."Json_ext"->>'dob', 'YYYY-MM-DD'),
-               loc."LocationId"
+    WITH candidates AS MATERIALIZED (
+        SELECT gen_random_uuid() AS individual_uuid, ds."UUID" AS source_uuid,
+               loc."LocationId" AS location_id
+
         FROM individual_individualdatasource AS ds
         LEFT JOIN "tblLocations" AS loc
             ON loc."LocationCode" = lpad(ds."Json_ext"->>'location_code', 9, '0')
@@ -137,15 +133,25 @@ BEGIN
                       lower(NULLIF(btrim(ds."Json_ext"->>'external_id'), ''))
                   AND NULLIF(btrim(ds."Json_ext"->>'external_id'), '') IS NOT NULL
           )
-        RETURNING "UUID", "Json_ext"
+    ), new_entry AS (
+        INSERT INTO individual_individual(
+            "UUID", "isDeleted", version, "UserCreatedUUID", "UserUpdatedUUID",
+            "Json_ext", first_name, last_name, dob, location_id
+        )
+        SELECT c.individual_uuid, false, 1, userUUID, userUUID,
+               src."Json_ext", src."Json_ext"->>'first_name', src."Json_ext"->>'last_name',
+               to_date(src."Json_ext"->>'dob', 'YYYY-MM-DD'), c.location_id
+        FROM candidates c
+        JOIN individual_individualdatasource src ON src."UUID" = c.source_uuid
+        RETURNING "UUID"
     )
     UPDATE individual_individualdatasource AS ids
     SET individual_id = ne."UUID"
-    FROM new_entry ne
+    FROM new_entry ne JOIN candidates c ON c.individual_uuid = ne."UUID"
     WHERE ids.upload_id = current_upload_id
       AND ids.individual_id IS NULL
       AND ids."isDeleted" = False
-      AND ids."Json_ext" = ne."Json_ext"
+      AND ids."UUID" = c.source_uuid
       AND COALESCE(ids.validations ->> 'validation_errors', '[]') = '[]';
 
     -- 2) LINK duplicates by external_id to existing Individuals (no insert, but set individual_id)
@@ -238,17 +244,10 @@ BEGIN
       );
 
         -- 1) INSERT brand-new Individuals (only accepted rows)
-        WITH new_entry AS (
-            INSERT INTO individual_individual(
-                "UUID", "isDeleted", version, "UserCreatedUUID", "UserUpdatedUUID",
-                "Json_ext", first_name, last_name, dob, location_id
-            )
-            SELECT gen_random_uuid(), false, 1, userUUID, userUUID,
-                   ds."Json_ext",
-                   ds."Json_ext"->>'first_name',
-                   ds."Json_ext"->>'last_name',
-                   to_date(ds."Json_ext"->>'dob', 'YYYY-MM-DD'),
-                   loc."LocationId"
+        WITH candidates AS MATERIALIZED (
+        SELECT gen_random_uuid() AS individual_uuid, ds."UUID" AS source_uuid,
+               loc."LocationId" AS location_id
+
             FROM individual_individualdatasource AS ds
             LEFT JOIN "tblLocations" AS loc
                     ON loc."LocationCode" = lpad(ds."Json_ext"->>'location_code', 9, '0')
@@ -267,15 +266,25 @@ BEGIN
                           lower(NULLIF(btrim(ds."Json_ext"->>'external_id'), ''))
                       AND NULLIF(btrim(ds."Json_ext"->>'external_id'), '') IS NOT NULL
               )
-            RETURNING "UUID", "Json_ext"
-        )
+        ), new_entry AS (
+        INSERT INTO individual_individual(
+                "UUID", "isDeleted", version, "UserCreatedUUID", "UserUpdatedUUID",
+                "Json_ext", first_name, last_name, dob, location_id
+            )
+            SELECT c.individual_uuid, false, 1, userUUID, userUUID,
+               src."Json_ext", src."Json_ext"->>'first_name', src."Json_ext"->>'last_name',
+               to_date(src."Json_ext"->>'dob', 'YYYY-MM-DD'), c.location_id
+        FROM candidates c
+        JOIN individual_individualdatasource src ON src."UUID" = c.source_uuid
+        RETURNING "UUID"
+    )
         UPDATE individual_individualdatasource AS ids
         SET individual_id = ne."UUID"
-        FROM new_entry ne
+        FROM new_entry ne JOIN candidates c ON c.individual_uuid = ne."UUID"
         WHERE ids.upload_id = current_upload_id
           AND ids.individual_id IS NULL
           AND ids."isDeleted" = False
-          AND ids."Json_ext" = ne."Json_ext"
+          AND ids."UUID" = c.source_uuid
           AND COALESCE(ids.validations ->> 'validation_errors', '[]') = '[]'
           AND (accepted IS NULL OR ids."UUID" = ANY(accepted));
 

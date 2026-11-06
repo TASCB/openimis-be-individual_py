@@ -2,6 +2,8 @@
 Functionalities shared between different python workflows.
 """
 
+from individual.import_performance import timed_phase
+
 import json
 import logging
 from abc import ABCMeta, abstractmethod
@@ -51,6 +53,7 @@ class BasePythonWorkflowExecutor(metaclass=ABCMeta):
             id=self.upload_uuid).values_list("json_ext", flat=True).first()
         return (upload_json or {}).get("payload_fields", [])
 
+    @timed_phase("validation_seconds")
     def validate_dataframe_headers(self, is_update=False):
         """
         Validates if DataFrame headers:
@@ -132,6 +135,7 @@ class SqlProcedurePythonWorkflow(BasePythonWorkflowExecutor):
         except Exception as e:
             raise PythonWorkflowHandlerException(str(e))
 
+    @timed_phase("sql_import_seconds")
     def _execute_sql_logic(self, sql_func: str, params: Iterable):
         with connection.cursor() as cursor:
             current_upload_id = self.upload_uuid

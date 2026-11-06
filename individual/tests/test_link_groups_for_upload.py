@@ -117,6 +117,20 @@ class LinkGroupsForUploadTest(TestCase):
         self.assertEqual(grp.json_ext.get("pmt_score_household"), 42.5)
         self.assertEqual(grp.json_ext.get("pmt_class_household"), "POOR")
 
+    def test_nested_import_pmt_is_mirrored_and_remains_after_rerun(self):
+        upload, created = self._upload_with({"NESTED-PMT": [("1", "1", None), ("3", "0", None)]})
+        head = created["NESTED-PMT"][0]
+        head.json_ext["json_ext"] = {
+            "pmt_class": "NON_POOR", "pmt_score": 12.5, "pmt_cutoff_used": 11.01,
+        }
+        head.save(user=self.user)
+        for _ in range(2):
+            self._run(upload)
+            group = Group.objects.get(code="NESTED-PMT", is_deleted=False)
+            self.assertEqual(group.json_ext["pmt_class_household"], "NON_POOR")
+            self.assertEqual(group.json_ext["pmt_score_household"], 12.5)
+            self.assertEqual(group.json_ext["pmt_cutoff_used"], 11.01)
+
     def test_group_aggregates_rebuilt_after_run(self):
         upload, created = self._upload_with({"G5": [("1", "1", 1.0), ("3", "0", None)]})
         self._run(upload)
